@@ -1,4 +1,4 @@
-<#PSScriptInfo
+﻿<#PSScriptInfo
 
 .VERSION 2.1.3
 .GUID 4296fcf1-a13d-4d31-afdc-bcbd4e05506d
@@ -411,8 +411,20 @@ param (
 	# (No params used directly here)
 
 	# Used throughout
-	[int]$SleepInterval = 2
+	# Poll interval (seconds) used by process-wait loops.
+	# Default set to 1 to preserve current effective behavior (previously hard-coded 1s waits).
+	[int]$SleepInterval = 1
 )
+
+# =============================
+# Script initialization (derived from parameters)
+# =============================
+
+# ScriptAnalyzer: these parameters were previously only "implicitly" relied on via $script: vars.
+# Make the relationship explicit and ensure script-scoped state is initialized.
+$script:randomColor = $randomColor
+$script:animIndex = $AnimIndex
+$script:AnimationChars = $AnimationChars
 
 # =============================
 # Step 1: Define helper functions and Win32 API for window management.
@@ -456,13 +468,133 @@ if (-not ([System.Management.Automation.PSTypeName]'Win32').Type) {
 	Add-Type -TypeDefinition $win32Code
 }
 
+# Host-safe console output helper (color + NoNewline) to replace Write-Host.
+# Keeps interactive behavior but avoids PSAvoidUsingWriteHost.
+function Write-Console {
+	[CmdletBinding()]
+	param(
+		[Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+		[object[]]$Object,
+		[ConsoleColor]$ForegroundColor,
+		[ConsoleColor]$BackgroundColor,
+		[switch]$NoNewline,
+		[string]$Separator = ' '
+	)
+
+	# Match Write-Host behavior: join all objects with separator, write to host (not pipeline)
+	$text = ($Object | ForEach-Object { if ($null -eq $_) { '' } else { $_.ToString() } }) -join $Separator
+
+	try {
+		if ($Host -and $Host.UI) {
+			$fgSpecified = $PSBoundParameters.ContainsKey('ForegroundColor')
+			$bgSpecified = $PSBoundParameters.ContainsKey('BackgroundColor')
+
+			if ($fgSpecified -or $bgSpecified) {
+				$fg = if ($fgSpecified) { $ForegroundColor } else { $Host.UI.RawUI.ForegroundColor }
+				$bg = if ($bgSpecified) { $BackgroundColor } else { $Host.UI.RawUI.BackgroundColor }
+
+				if ($NoNewline) { $Host.UI.Write($fg, $bg, $text) }
+				else { $Host.UI.WriteLine($fg, $bg, $text) }
+			}
+			else {
+				if ($NoNewline) { $Host.UI.Write($text) }
+				else { $Host.UI.WriteLine($text) }
+			}
+			return
+		}
+	}
+	catch {
+		# Fall through to non-host fallback
+		Write-Verbose "Write-Console host write failed: $($_.Exception.Message)"
+	}
+
+	# Fallback: write to the success output stream (may be captured/redirected; no color).
+	# NOTE: Write-Output does not support -NoNewline; in non-host scenarios we accept the newline.
+	Write-Output $text
+}
+
+function Test-LogPatternMatch {
+	[CmdletBinding()]
+	param(
+		[AllowNull()] [string[]]$Lines,
+		[Parameter(Mandatory)] [string[]]$Patterns
+	)
+
+	if (-not $Lines) { return $false }
+
+	foreach ($pattern in $Patterns) {
+		if ($Lines -match $pattern) {
+			return $true
+		}
+	}
+
+	return $false
+}
+
+function Wait-ForLogPatterns {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory)] [string]$LiteralPath,
+		[Parameter(Mandatory)] [string[]]$Patterns,
+		[int]$PollSeconds = 1,
+		[int]$InitialTailLines = 2000,
+		[string]$MatchDescription = 'log pattern'
+	)
+
+	if (-not (Test-Path -LiteralPath $LiteralPath)) {
+		return $false
+	}
+
+	if ($InitialTailLines -gt 0) {
+		try {
+			$recentLines = Get-Content -LiteralPath $LiteralPath -Tail $InitialTailLines -ErrorAction Stop
+			if (Test-LogPatternMatch -Lines $recentLines -Patterns $Patterns) {
+				Write-Console "$(Get-Date): Detected $MatchDescription in recent Zwift log lines." -ForegroundColor Green
+				return $true
+			}
+		}
+		catch {
+			Write-Verbose "Initial log scan failed: $($_.Exception.Message)"
+		}
+	}
+
+	$logStream = $null
+	$reader = $null
+
+	try {
+		$logStream = [System.IO.File]::Open($LiteralPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		$reader = New-Object System.IO.StreamReader($logStream)
+		$null = $reader.BaseStream.Seek(0, [System.IO.SeekOrigin]::End)
+
+		while ($true) {
+			Start-Sleep -Seconds ([Math]::Max(1, $PollSeconds))
+			while ($null -ne ($line = $reader.ReadLine())) {
+				foreach ($pattern in $Patterns) {
+					if ($line -match $pattern) {
+						Write-Console "$(Get-Date): Detected $MatchDescription in Zwift log!" -ForegroundColor Green
+						return $true
+					}
+				}
+			}
+		}
+	}
+	finally {
+		if ($null -ne $reader) { $reader.Close() }
+		elseif ($null -ne $logStream) { $logStream.Close() }
+	}
+}
+
 # Win32 API helper for robust window activation (works for OBS and others)
 function Set-WindowFocus {
+	[CmdletBinding(SupportsShouldProcess = $true)]
 	param([System.Diagnostics.Process]$proc)
 	if (-not $proc) { return $false }
 	$hWnd = $proc.MainWindowHandle
 	if ($hWnd -eq 0) {
-		Write-Host "[$(Get-Date -Format o)] Process has no MainWindowHandle." -ForegroundColor Yellow
+		Write-Console "[$(Get-Date -Format o)] Process has no MainWindowHandle." -ForegroundColor Yellow
+		return $false
+	}
+	if (-not $PSCmdlet.ShouldProcess($proc.ProcessName, 'Set window focus (foreground)')) {
 		return $false
 	}
 	# If minimized, restore window (SW_RESTORE = 9)
@@ -487,10 +619,10 @@ public class Win32Activate {
 	}
 	$result = [Win32Activate]::SetForegroundWindow($hWnd)
 	if ($result) {
-		Write-Host "[$(Get-Date -Format o)] Window activated using Win32 API."
+		Write-Console "[$(Get-Date -Format o)] Window activated using Win32 API."
 	}
 	else {
-		Write-Host "[$(Get-Date -Format o)] Failed to activate window using Win32 API." -ForegroundColor Yellow
+		Write-Console "[$(Get-Date -Format o)] Failed to activate window using Win32 API." -ForegroundColor Yellow
 	}
 	return $result
 }
@@ -565,7 +697,7 @@ function Test-TaskCompletion {
 		Get-CompletedTasks -Tracker $taskTracker
 		Returns the list of completed tasks from the task tracker.
 #>
-function Get-CompletedTasks {
+function Get-CompletedTask {
 	param (
 		[hashtable]$Tracker
 	)
@@ -589,10 +721,12 @@ function Get-CompletedTasks {
 function Show-WaitingAnimation {
 	param (
 		[string]$Message,
-		[bool]$Continue
+		[bool]$Continue = $true,
+		[string[]]$AnimationChars = $script:AnimationChars
 	)
+	if (-not $Continue) { return }
 	$script:animIndex = ($script:animIndex + 1) % $AnimationChars.Length
-	Write-Host "`r$Message $($AnimationChars[$script:animIndex])" -NoNewline -ForegroundColor $script:randomColor
+	Write-Console "`r$Message $($AnimationChars[$script:animIndex])" -NoNewline -ForegroundColor $script:randomColor
 }
 
 # Function: Wait-WithAnimation
@@ -634,9 +768,9 @@ function Wait-WithAnimation {
 function Import-DisplayConfigModule {
 	try {
 		if (-not (Get-Module -ListAvailable -Name DisplayConfig)) {
-			Write-Host "$(Get-Date): DisplayConfig module not found. Downloading..." -ForegroundColor Yellow
+			Write-Console "$(Get-Date): DisplayConfig module not found. Downloading..." -ForegroundColor Yellow
 			Install-Module -Name DisplayConfig -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
-			Write-Host "$(Get-Date): Module downloaded and installed successfully." -ForegroundColor Green
+			Write-Console "$(Get-Date): Module downloaded and installed successfully." -ForegroundColor Green
 		}
 	}
 	catch {
@@ -645,7 +779,7 @@ function Import-DisplayConfigModule {
 
 	try {
 		Import-Module DisplayConfig -ErrorAction Stop
-		Write-Host "$(Get-Date): Successfully imported DisplayConfig module." -ForegroundColor Green
+		Write-Console "$(Get-Date): Successfully imported DisplayConfig module." -ForegroundColor Green
 	}
 	catch {
 		Write-Error "$(Get-Date): Failed to import DisplayConfig module: $($_.Exception.Message). Continuing without it."
@@ -688,20 +822,24 @@ function Get-ProcessRunning {
 #>
 # Function to set window transparency using UWP API
 function Set-WindowTransparencyUWP {
+	[CmdletBinding(SupportsShouldProcess = $true)]
 	param (
 		[int]$Transparency # Set at the beginning of the script
 	)
 	try {
+		if (-not $PSCmdlet.ShouldProcess('Current window', "Set transparency to $Transparency%")) {
+			return
+		}
 		if ($allowedProcesses -contains $processName) {
-			Write-Host "$(Get-Date): Trying to set window transparency to $Transparency%..." -ForegroundColor Cyan
+			Write-Console "$(Get-Date): Trying to set window transparency to $Transparency%..." -ForegroundColor Cyan
 			$null = [Win32]::SetWindowLong($hwnd, [Win32]::GWL_EXSTYLE, $style -bor [Win32]::WS_EX_LAYERED)
 			# Ensure transparency value of 0 sets the window to fully opaque
 			$opacity = if ($Transparency -eq 0) { 255 } else { [byte]((100 - $Transparency) * 255 / 100) }
 			$null = [Win32]::SetLayeredWindowAttributes($hwnd, 0, $opacity, [Win32]::LWA_ALPHA)
-			Write-Host "$(Get-Date): Successfully set window transparency to $Transparency%" -ForegroundColor Green
+			Write-Console "$(Get-Date): Successfully set window transparency to $Transparency%" -ForegroundColor Green
 		}
 		else {
-			Write-Host "$(Get-Date): The foreground window is not a PowerShell or Windows Terminal window. Transparency not applied." -ForegroundColor Yellow
+			Write-Console "$(Get-Date): The foreground window is not a PowerShell or Windows Terminal window. Transparency not applied." -ForegroundColor Yellow
 		}
 	}
 	catch {
@@ -722,10 +860,14 @@ function Set-WindowTransparencyUWP {
 #>
 # Function to set the primary display using the DisplayConfig module and handle exceptions
 function Set-PrimaryDisplay {
+	[CmdletBinding(SupportsShouldProcess = $true)]
 	param ([int]$DisplayIndex)
 	try {
+		if (-not $PSCmdlet.ShouldProcess("DisplayIndex=$DisplayIndex", 'Set primary display')) {
+			return
+		}
 		Set-DisplayPrimary $DisplayIndex
-		Write-Host "$(Get-Date): Primary display set to $DisplayIndex" -ForegroundColor Green
+		Write-Console "$(Get-Date): Primary display set to $DisplayIndex" -ForegroundColor Green
 	}
 	catch {
 		Write-Error "$(Get-Date): Failed to set primary display to ${DisplayIndex}: $($_.Exception.Message)"
@@ -760,15 +902,15 @@ function Show-TaskCompletionSummary {
 	try {
 		# Only use the order in which tasks were completed
 		$completedOrdered = $Tracker.CompletedTasks
-		Write-Host "$(Get-Date): Task Completion Summary (in order completed):" -ForegroundColor Cyan
+		Write-Console "$(Get-Date): Task Completion Summary (in order completed):" -ForegroundColor Cyan
 		foreach ($task in $completedOrdered) {
-			Write-Host "- ${task}: Completed" -ForegroundColor Green
+			Write-Console "- ${task}: Completed" -ForegroundColor Green
 		}
 		# Optionally, show any tasks in $tasksCompleted that were not completed (if needed)
 		if ($tasksCompleted) {
 			foreach ($task in $tasksCompleted) {
 				if ($task -notin $completedOrdered) {
-					Write-Host "- ${task}: Not Completed" -ForegroundColor Red
+					Write-Console "- ${task}: Not Completed" -ForegroundColor Red
 				}
 			}
 		}
@@ -823,7 +965,7 @@ function Get-RemainingTime {
 			return $remainingTimeinSeconds
 		}
 		else {
-			Write-Host "$(Get-Date): No valid remaining time parameter provided. Exiting script." -ForegroundColor Red
+			Write-Console "$(Get-Date): No valid remaining time parameter provided. Exiting script." -ForegroundColor Red
 			exit
 		}
 	}
@@ -856,13 +998,13 @@ function Invoke-ReviewCountdownAndCleanup {
 		[int]$remainingTime
 	)
 	try {
-		Write-Host "$(Get-Date): Script execution completed. The window will remain open for review for $([TimeSpan]::FromSeconds($remainingTime).ToString('hh\:mm\:ss'))." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): Script execution completed. The window will remain open for review for $([TimeSpan]::FromSeconds($remainingTime).ToString('hh\:mm\:ss'))." -ForegroundColor Yellow
 		$originalRemainingTime = $remainingTime
 		$exitEarly = $false
 		while ($remainingTime -gt 0) {
 			try {
 				if ([Console]::KeyAvailable) {
-					Write-Host "`n$(Get-Date): Key press detected. Exiting script, window will remain open." -ForegroundColor Yellow
+					Write-Console "`n$(Get-Date): Key press detected. Exiting script, window will remain open." -ForegroundColor Yellow
 					$exitEarly = $true
 					break
 				}
@@ -879,12 +1021,12 @@ function Invoke-ReviewCountdownAndCleanup {
 		# --- Always attempt to stop PowerToys Awake, regardless of exitEarly ---
 		try {
 			if (Get-Process -Name 'PowerToys.Awake' -ErrorAction SilentlyContinue) {
-				Write-Host "$(Get-Date): PowerToys Awake is running. Stopping it now..." -ForegroundColor Cyan
+				Write-Console "$(Get-Date): PowerToys Awake is running. Stopping it now..." -ForegroundColor Cyan
 				Get-Process -Name 'PowerToys.Awake' -ErrorAction SilentlyContinue | Stop-Process -Force
-				Write-Host "$(Get-Date): PowerToys Awake stopped successfully." -ForegroundColor Green
+				Write-Console "$(Get-Date): PowerToys Awake stopped successfully." -ForegroundColor Green
 			}
 			else {
-				Write-Host "$(Get-Date): PowerToys Awake is not running. No action needed." -ForegroundColor Yellow
+				Write-Console "$(Get-Date): PowerToys Awake is not running. No action needed." -ForegroundColor Yellow
 			}
 		}
 		catch {
@@ -892,12 +1034,12 @@ function Invoke-ReviewCountdownAndCleanup {
 		}
 
 		if ($exitEarly) {
-			Write-Host "$(Get-Date): Exiting review early due to key press. Window will remain open." -ForegroundColor Yellow
+			Write-Console "$(Get-Date): Exiting review early due to key press. Window will remain open." -ForegroundColor Yellow
 			return
 		}
 		else {
-			Write-Host "`n$(Get-Date): Script review time over. $([TimeSpan]::FromSeconds($originalRemainingTime).ToString('hh\:mm\:ss')) has passed since the script ended." -ForegroundColor Yellow
-			Write-Host "$(Get-Date): Closing the script now." -ForegroundColor Yellow
+			Write-Console "`n$(Get-Date): Script review time over. $([TimeSpan]::FromSeconds($originalRemainingTime).ToString('hh\:mm\:ss')) has passed since the script ended." -ForegroundColor Yellow
+			Write-Console "$(Get-Date): Closing the script now." -ForegroundColor Yellow
 		}
 	}
 	catch {
@@ -927,7 +1069,7 @@ try {
 
 	# Validate display index
 	if ($TargetDisplayIndex -lt 1 -or $TargetDisplayIndex -gt [System.Windows.Forms.Screen]::AllScreens.Count) {
-		Write-Host "Invalid TargetDisplayIndex: $TargetDisplayIndex. Defaulting to 1." -ForegroundColor Yellow
+		Write-Console "Invalid TargetDisplayIndex: $TargetDisplayIndex. Defaulting to 1." -ForegroundColor Yellow
 		$TargetDisplayIndex = 1
 	}
 
@@ -941,11 +1083,11 @@ try {
 
 		# Set the window position to the target display
 		[Win32]::SetWindowPos($hwnd, [IntPtr]::Zero, $x + $WindowPositionX, $y + $WindowPositionY, $WindowWidth, $WindowHeight, [Win32]::SWP_NOZORDER -bor [Win32]::SWP_SHOWWINDOW)
-		Write-Host "$(Get-Date): Successfully resized and positioned the PowerShell window on display $TargetDisplayIndex." -ForegroundColor Green
+		Write-Console "$(Get-Date): Successfully resized and positioned the PowerShell window on display $TargetDisplayIndex." -ForegroundColor Green
 		Add-CompletedTask -Tracker $taskTracker -TaskName 'Resized and positioned PowerShell window'
 	}
 	else {
-		Write-Host "$(Get-Date): Target display not found. Resizing in current display." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): Target display not found. Resizing in current display." -ForegroundColor Yellow
 		[Win32]::SetWindowPos($hwnd, [IntPtr]::Zero, $WindowPositionX, $WindowPositionY, $WindowWidth, $WindowHeight, [Win32]::SWP_NOZORDER -bor [Win32]::SWP_SHOWWINDOW)
 	}
 }
@@ -958,7 +1100,7 @@ catch {
 # =============================
 
 try {
-	Write-Host "$(Get-Date): Attempting to import DisplayConfig module..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Attempting to import DisplayConfig module..." -ForegroundColor Cyan
 	Import-DisplayConfigModule
 	Add-CompletedTask -Tracker $taskTracker -TaskName 'Imported DisplayConfig module'
 }
@@ -1031,18 +1173,17 @@ else {
 # =============================
 
 try {
-	Write-Host "$(Get-Date): Waiting for Zwift launcher to start..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Waiting for Zwift launcher to start..." -ForegroundColor Cyan
 	while (-not (Get-ProcessRunning -ProcessName $ZwiftLauncher)) {
-		Wait-WithAnimation -Seconds 1 -Message "Waiting for $ZwiftLauncher"
+		Wait-WithAnimation -Seconds $SleepInterval -Message "Waiting for $ZwiftLauncher"
 	}
 
 	# Validate display index
 	if ($PrimaryDisplayZwift -lt 0 -or $PrimaryDisplayZwift -ge [System.Windows.Forms.Screen]::AllScreens.Count) {
-		Write-Host "Invalid PrimaryDisplayZwift index: $PrimaryDisplayZwift. Defaulting to 1." -ForegroundColor Yellow
+		Write-Console "Invalid PrimaryDisplayZwift index: $PrimaryDisplayZwift. Defaulting to 1." -ForegroundColor Yellow
 		$PrimaryDisplayZwift = 1
 	}
-
-	Write-Host "$(Get-Date): Zwift launcher detected. Switching primary display to $($PrimaryDisplayZwift + 1)" -ForegroundColor Green
+	Write-Console "$(Get-Date): Zwift launcher detected. Switching primary display to $($PrimaryDisplayZwift + 1)" -ForegroundColor Green
 	Set-PrimaryDisplay ($PrimaryDisplayZwift + 1) # + 1 to make it one-based index for the DisplayConfig module (index: 4)
 	Add-CompletedTask -Tracker $taskTracker -TaskName 'Zwift launcher running'
 	Add-CompletedTask -Tracker $taskTracker -TaskName 'Primary display set for Zwift'
@@ -1058,7 +1199,7 @@ catch {
 # Launch the PowerToys Workspaces for Zwift (if installed) after the Zwift launcher starts
 try {
 	# Check if all of the specified applications are running
-	Write-Host "$(Get-Date): Checking if all specified applications are running..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Checking if all specified applications are running..." -ForegroundColor Cyan
 	$allAppsRunning = $true
 	foreach ($app in $AppsToCheck) {
 		try {
@@ -1076,9 +1217,17 @@ try {
 
 	if (-not $allAppsRunning) {
 		try {
-			Write-Host "$(Get-Date): Launching Zwift PowerToys Workspaces..." -ForegroundColor Cyan
+			# If the Workspaces launcher path is wrong/missing, try to derive it from PowerToys.exe
+			if (-not (Test-Path -LiteralPath $PowerToysWorkspacesPath) -and (Test-Path -LiteralPath $PowerToysPath)) {
+				$ptDir = Split-Path -Parent $PowerToysPath
+				$candidate = Join-Path $ptDir 'PowerToys.WorkspacesLauncher.exe'
+				if (Test-Path -LiteralPath $candidate) {
+					$PowerToysWorkspacesPath = $candidate
+				}
+			}
+			Write-Console "$(Get-Date): Launching Zwift PowerToys Workspaces..." -ForegroundColor Cyan
 			Start-Process -FilePath $PowerToysWorkspacesPath -ArgumentList "$WorkspaceGuid 1"
-			Write-Host "$(Get-Date): Zwift PowerToys Workspaces launched successfully." -ForegroundColor Green
+			Write-Console "$(Get-Date): Zwift PowerToys Workspaces launched successfully." -ForegroundColor Green
 			Add-CompletedTask -Tracker $taskTracker -TaskName 'PowerToys Workspaces launched or skipped'
 		}
 		catch {
@@ -1086,7 +1235,7 @@ try {
 		}
 	}
 	else {
-		Write-Host "$(Get-Date): All specified applications are running. Skipping PowerToys Workspaces launch." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): All specified applications are running. Skipping PowerToys Workspaces launch." -ForegroundColor Yellow
 	}
 }
 catch {
@@ -1098,11 +1247,11 @@ catch {
 # =============================
 
 try {
-	Write-Host "$(Get-Date): Waiting for Zwift game to start..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Waiting for Zwift game to start..." -ForegroundColor Cyan
 	while (-not (Get-ProcessRunning -ProcessName $ZwiftGame)) {
-		Wait-WithAnimation -Seconds 1 -Message "Waiting for $ZwiftGame"
+		Wait-WithAnimation -Seconds $SleepInterval -Message "Waiting for $ZwiftGame"
 	}
-	Write-Host "$(Get-Date): Zwift game detected." -ForegroundColor Green
+	Write-Console "$(Get-Date): Zwift game detected." -ForegroundColor Green
 	Add-CompletedTask -Tracker $taskTracker -TaskName 'Zwift game started'
 }
 catch {
@@ -1111,32 +1260,32 @@ catch {
 
 # Wait for a specified amount of time before maximizing the Zwift game window
 try {
-	Write-Host "$(Get-Date): Waiting for $ZwiftGameMaximizeDelay seconds before maximizing the Zwift game window..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Waiting for $ZwiftGameMaximizeDelay seconds before maximizing the Zwift game window..." -ForegroundColor Cyan
 
 	# Countdown animation
 	for ($i = $ZwiftGameMaximizeDelay; $i -gt 0; $i--) {
-		Write-Host "`rWaiting: $i seconds remaining..." -NoNewline -ForegroundColor Yellow
+		Write-Console "`rWaiting: $i seconds remaining..." -NoNewline -ForegroundColor Yellow
 		Start-Sleep -Seconds 1
 	}
-	Write-Host "`rCountdown complete. Proceeding..." -ForegroundColor Green
+	Write-Console "`rCountdown complete. Proceeding..." -ForegroundColor Green
 
 	$ZwiftProcess = Get-Process -Name $ZwiftGame -ErrorAction SilentlyContinue
 	if ($ZwiftProcess) {
 		# Get the main window handle of the Zwift game process
 		$ZwiftHwnd = $ZwiftProcess.MainWindowHandle
-		Write-Host "Zwift MainWindowHandle: $ZwiftHwnd"
+		Write-Console "Zwift MainWindowHandle: $ZwiftHwnd"
 		# If the handle is valid, maximize the window
 		if ($ZwiftHwnd -ne [IntPtr]::Zero) {
 			[Win32]::ShowWindow($ZwiftHwnd, [Win32]::SW_MAXIMIZE)
-			Write-Host "$(Get-Date): Zwift game window maximized successfully." -ForegroundColor Green
+			Write-Console "$(Get-Date): Zwift game window maximized successfully." -ForegroundColor Green
 			Add-CompletedTask -Tracker $taskTracker -TaskName 'Zwift game window maximized'
 		}
 		else {
-			Write-Host "$(Get-Date): Zwift game window handle not found. Unable to maximize." -ForegroundColor Yellow
+			Write-Console "$(Get-Date): Zwift game window handle not found. Unable to maximize." -ForegroundColor Yellow
 		}
 	}
 	else {
-		Write-Host "$(Get-Date): Zwift game process not found. Unable to maximize window." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): Zwift game process not found. Unable to maximize window." -ForegroundColor Yellow
 	}
 }
 catch {
@@ -1149,7 +1298,7 @@ catch {
 
 # Move OBS to the Zwift monitor, center it, and resize to 80% of the monitor's width and height
 try {
-	Write-Host "$(Get-Date): Attempting to move OBS to the Zwift monitor, center it, and resize to 80% of the monitor's dimensions..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Attempting to move OBS to the Zwift monitor, center it, and resize to 80% of the monitor's dimensions..." -ForegroundColor Cyan
 	$ObsProcess = Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue
 	if ($ObsProcess) {
 		$ObsHwnd = $ObsProcess.MainWindowHandle
@@ -1158,7 +1307,7 @@ try {
 			Add-Type -AssemblyName System.Windows.Forms
 			# Validate display index
 			if ($PrimaryDisplayZwift -lt 0 -or $PrimaryDisplayZwift -ge [System.Windows.Forms.Screen]::AllScreens.Count) {
-				Write-Host "Invalid PrimaryDisplayZwift index: $PrimaryDisplayZwift. Defaulting to 1." -ForegroundColor Yellow
+				Write-Console "Invalid PrimaryDisplayZwift index: $PrimaryDisplayZwift. Defaulting to 1." -ForegroundColor Yellow
 				$PrimaryDisplayZwift = 1
 			}
 			# Get the display index for Zwift (1-based index)
@@ -1181,19 +1330,19 @@ try {
 				# Move and resize OBS to be centered and 80% of the Zwift display
 				[Win32]::SetWindowPos($ObsHwnd, [IntPtr]::Zero, $ObsX, $ObsY, $ObsWidth, $ObsHeight, [Win32]::SWP_SHOWWINDOW)
 				[Win32]::ShowWindow($ObsHwnd, 5) # SW_SHOW
-				Write-Host "$(Get-Date): OBS moved to Zwift monitor, centered, and resized to 80% of the display." -ForegroundColor Green
+				Write-Console "$(Get-Date): OBS moved to Zwift monitor, centered, and resized to 80% of the display." -ForegroundColor Green
 				Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS moved to Zwift monitor and centered/resized'
 			}
 			else {
-				Write-Host "$(Get-Date): Zwift display index $ZwiftDisplayIndex not found. Skipping OBS move." -ForegroundColor Yellow
+				Write-Console "$(Get-Date): Zwift display index $ZwiftDisplayIndex not found. Skipping OBS move." -ForegroundColor Yellow
 			}
 		}
 		else {
-			Write-Host "$(Get-Date): OBS window handle not found. Skipping OBS move." -ForegroundColor Yellow
+			Write-Console "$(Get-Date): OBS window handle not found. Skipping OBS move." -ForegroundColor Yellow
 		}
 	}
 	else {
-		Write-Host "$(Get-Date): OBS is not running. Skipping OBS move." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): OBS is not running. Skipping OBS move." -ForegroundColor Yellow
 	}
 }
 catch {
@@ -1205,16 +1354,16 @@ catch {
 # =============================
 
 try {
-	Write-Host "$(Get-Date): Checking for Spotify before starting OBS recording..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Checking for Spotify before starting OBS recording..." -ForegroundColor Cyan
 	$SpotifyProcess = Get-Process -Name $SpotifyProcessName -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
 	if ($SpotifyProcess) {
-		Write-Host "$(Get-Date): Spotify is running. Focusing window and sending Play hotkey (Spacebar)..." -ForegroundColor Green
+		Write-Console "$(Get-Date): Spotify is running. Focusing window and sending Play hotkey (Spacebar)..." -ForegroundColor Green
 		try {
 			Set-WindowFocus $SpotifyProcess | Out-Null
 			Start-Sleep -Milliseconds 500
 			$wshell = New-Object -ComObject WScript.Shell
 			$wshell.SendKeys(' ')
-			Write-Host "$(Get-Date): Sent Play hotkey (Spacebar) to Spotify." -ForegroundColor Green
+			Write-Console "$(Get-Date): Sent Play hotkey (Spacebar) to Spotify." -ForegroundColor Green
 			Add-CompletedTask -Tracker $taskTracker -TaskName 'Spotify play hotkey sent'
 		}
 		catch {
@@ -1222,7 +1371,7 @@ try {
 		}
 	}
 	else {
-		Write-Host "$(Get-Date): Spotify is not running. Skipping play hotkey." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): Spotify is not running. Skipping play hotkey." -ForegroundColor Yellow
 	}
 }
 catch {
@@ -1236,32 +1385,18 @@ catch {
 $GameFlowRidingDetected = $false
 
 if (Test-Path -Path $ZwiftLogPath) {
-	Write-Host "$(Get-Date): Monitoring Zwift log for '[ZWATCHDOG]: GameFlowState Riding'..." -ForegroundColor Cyan
-	try {
-		$logStream = [System.IO.File]::Open($ZwiftLogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-		$reader = New-Object System.IO.StreamReader($logStream)
-		# Move to end of file
-		$null = $reader.BaseStream.Seek(0, [System.IO.SeekOrigin]::End)
-		while (-not $GameFlowRidingDetected) {
-			Start-Sleep -Seconds 1
-			while ($null -ne ($line = $reader.ReadLine())) {
-				if ($line -match '\[ZWATCHDOG\]: GameFlowState Riding') {
-					Write-Host "$(Get-Date): Detected 'GameFlowState Riding' in Zwift log!" -ForegroundColor Green
-					$GameFlowRidingDetected = $true
-					break
-				}
-			}
-		}
-	}
-	finally {
-		if ($null -ne $reader) { $reader.Close() }
-		if ($null -ne $logStream) { $logStream.Close() }
-	}
+	Write-Console "$(Get-Date): Monitoring Zwift log for ride-start markers..." -ForegroundColor Cyan
+	$rideStartPatterns = @(
+		'\[ZWATCHDOG\]: GameFlowState Riding',
+		'INFO LEVEL: \[GameState\] Starting Ride\.',
+		'INFO LEVEL: \[GameState\] ZSF_INITIAL_CHALLENGE_SELECT -> ZSF_RIDE'
+	)
+	$GameFlowRidingDetected = Wait-ForLogPatterns -LiteralPath $ZwiftLogPath -Patterns $rideStartPatterns -PollSeconds 1 -InitialTailLines 2000 -MatchDescription 'a ride-start marker'
 
 	# Check if OBS is running
 	$obsProcess = Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue
 	if (-not $obsProcess) {
-		Write-Host "$(Get-Date): OBS is NOT running!" -ForegroundColor Red
+		Write-Console "$(Get-Date): OBS is NOT running!" -ForegroundColor Red
 		$obsPromptTimeout = 15 # seconds
 		$obsPromptStart = Get-Date
 		$userInput = $null
@@ -1274,28 +1409,28 @@ if (Test-Path -Path $ZwiftLogPath) {
 			}
 		}
 		if ($null -eq $userInput) {
-			Write-Host "No input received after $obsPromptTimeout seconds. Defaulting to 'N'." -ForegroundColor Yellow
+			Write-Console "No input received after $obsPromptTimeout seconds. Defaulting to 'N'." -ForegroundColor Yellow
 			$userInput = 'N'
 		}
 		if ($userInput -match '^(Y|y)') {
 			if (Test-Path -Path $obsPath) {
 				Start-Process -FilePath $obsPath
-				Write-Host "$(Get-Date): OBS started." -ForegroundColor Green
+				Write-Console "$(Get-Date): OBS started." -ForegroundColor Green
 				# Wait for OBS to start
 				Start-Sleep -Seconds 3
 				$obsProcess = Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue
 				Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS started after user prompt'
 			}
 			else {
-				Write-Host "$(Get-Date): OBS executable not found at $obsPath. Please start OBS manually." -ForegroundColor Yellow
+				Write-Console "$(Get-Date): OBS executable not found at $obsPath. Please start OBS manually." -ForegroundColor Yellow
 			}
 		}
 		else {
-			Write-Host "$(Get-Date): OBS will not be started automatically. Remember to start it if you want to record!" -ForegroundColor Yellow
+			Write-Console "$(Get-Date): OBS will not be started automatically. Remember to start it if you want to record!" -ForegroundColor Yellow
 		}
 	}
 	else {
-		Write-Host "$(Get-Date): OBS is already running." -ForegroundColor Green
+		Write-Console "$(Get-Date): OBS is already running." -ForegroundColor Green
 	}
 
 	# After checking/starting OBS, check if recording has started in the latest OBS log
@@ -1309,7 +1444,7 @@ if (Test-Path -Path $ZwiftLogPath) {
 					$retryCount = 0
 					$maxRetries = 3
 					while (-not $obsProc -and $retryCount -lt $maxRetries) {
-						Write-Host "$(Get-Date): OBS process not found. Retrying in 5 seconds... (Attempt $($retryCount + 1) of $maxRetries)" -ForegroundColor Yellow
+						Write-Console "$(Get-Date): OBS process not found. Retrying in 5 seconds... (Attempt $($retryCount + 1) of $maxRetries)" -ForegroundColor Yellow
 						Start-Sleep -Seconds 5
 						$obsProc = Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue
 						$retryCount++
@@ -1319,15 +1454,15 @@ if (Test-Path -Path $ZwiftLogPath) {
 						Set-WindowFocus $obsProc | Out-Null
 					}
 					else {
-						Write-Host "$(Get-Date): OBS process could not be found after $maxRetries attempts. Please start OBS manually." -ForegroundColor Red
+						Write-Console "$(Get-Date): OBS process could not be found after $maxRetries attempts. Please start OBS manually." -ForegroundColor Red
 					}
 					Start-Sleep -Milliseconds 500
 				}
-				Write-Host "$(Get-Date): OBS recording already started (detected in log)." -ForegroundColor Green
+				Write-Console "$(Get-Date): OBS recording already started (detected in log)." -ForegroundColor Green
 				Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS recording already started, detected in log'
 			}
 			else {
-				Write-Host "$(Get-Date): OBS recording not detected in log. Attempting to start recording..." -ForegroundColor Yellow
+				Write-Console "$(Get-Date): OBS recording not detected in log. Attempting to start recording..." -ForegroundColor Yellow
 				# Try to start recording using OBS hotkey (simulate hotkey Ctrl+F11 by default)
 				$wshell = New-Object -ComObject WScript.Shell
 				$obsProc = Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue
@@ -1339,12 +1474,12 @@ if (Test-Path -Path $ZwiftLogPath) {
 					if ($obsProc -and $obsProc.MainWindowHandle -ne 0) {
 						$activated = Set-WindowFocus $obsProc
 						if (-not $activated) {
-							Write-Host "[$(Get-Date -Format o)] Retry $($retryCount+1): Failed to activate OBS window. Retrying in 1s..." -ForegroundColor Yellow
+							Write-Console "[$(Get-Date -Format o)] Retry $($retryCount+1): Failed to activate OBS window. Retrying in 1s..." -ForegroundColor Yellow
 							Start-Sleep -Seconds 1
 						}
 					}
 					else {
-						Write-Host "[$(Get-Date -Format o)] OBS MainWindowHandle not ready. Waiting..." -ForegroundColor Yellow
+						Write-Console "[$(Get-Date -Format o)] OBS MainWindowHandle not ready. Waiting..." -ForegroundColor Yellow
 						Start-Sleep -Seconds 1
 						$obsProc = Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue
 					}
@@ -1352,7 +1487,7 @@ if (Test-Path -Path $ZwiftLogPath) {
 				}
 
 				if (-not $activated) {
-					Write-Host "[$(Get-Date -Format o)] Could not activate OBS window after $maxRetries attempts. Please manually focus OBS before recording." -ForegroundColor Red
+					Write-Console "[$(Get-Date -Format o)] Could not activate OBS window after $maxRetries attempts. Please manually focus OBS before recording." -ForegroundColor Red
 					Read-Host 'Press Enter to continue and send the recording hotkey to OBS'
 				}
 
@@ -1379,15 +1514,15 @@ public class Win32Activate {
 			}
 		}
 		else {
-			Write-Host "$(Get-Date): No OBS log files found to check recording status." -ForegroundColor Yellow
+			Write-Console "$(Get-Date): No OBS log files found to check recording status." -ForegroundColor Yellow
 		}
 	}
 	else {
-		Write-Host "$(Get-Date): OBS log directory not found: $ObsLogDir" -ForegroundColor Yellow
+		Write-Console "$(Get-Date): OBS log directory not found: $ObsLogDir" -ForegroundColor Yellow
 	}
 }
 else {
-	Write-Host "$(Get-Date): Zwift log file not found at $ZwiftLogPath. Skipping log monitoring for ride start." -ForegroundColor Yellow
+	Write-Console "$(Get-Date): Zwift log file not found at $ZwiftLogPath. Skipping log monitoring for ride start." -ForegroundColor Yellow
 }
 
 # =============================
@@ -1395,11 +1530,11 @@ else {
 # =============================
 
 try {
-	Write-Host "$(Get-Date): Zwift game is running. Waiting for it to close..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Zwift game is running. Waiting for it to close..." -ForegroundColor Cyan
 	while (Get-ProcessRunning -ProcessName $ZwiftGame) {
-		Wait-WithAnimation -Seconds 1 -Message "Waiting for $ZwiftGame"
+		Wait-WithAnimation -Seconds $SleepInterval -Message "Waiting for $ZwiftGame"
 	}
-	Write-Host "$(Get-Date): Zwift game closed." -ForegroundColor Green
+	Write-Console "$(Get-Date): Zwift game closed." -ForegroundColor Green
 	Add-CompletedTask -Tracker $taskTracker -TaskName 'Zwift game closed'
 }
 catch {
@@ -1411,17 +1546,17 @@ catch {
 # =============================
 
 try {
-	Write-Host "$(Get-Date): Checking for Sauce for Zwift process..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Checking for Sauce for Zwift process..." -ForegroundColor Cyan
 	$SauceProcess = Get-Process -Name $SauceProcessName -ErrorAction SilentlyContinue
 
 	if ($SauceProcess) {
-		Write-Host "$(Get-Date): Sauce for Zwift is running. Closing it..." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): Sauce for Zwift is running. Closing it..." -ForegroundColor Yellow
 		$SauceProcess | Stop-Process -Force
-		Write-Host "$(Get-Date): Sauce for Zwift closed successfully." -ForegroundColor Green
+		Write-Console "$(Get-Date): Sauce for Zwift closed successfully." -ForegroundColor Green
 		Add-CompletedTask -Tracker $taskTracker -TaskName 'Sauce for Zwift closed or skipped'
 	}
 	else {
-		Write-Host "$(Get-Date): Sauce for Zwift is not running. Skipping..." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): Sauce for Zwift is not running. Skipping..." -ForegroundColor Yellow
 		Add-CompletedTask -Tracker $taskTracker -TaskName 'Sauce for Zwift closed or skipped'
 	}
 }
@@ -1436,13 +1571,12 @@ catch {
 try {
 	# Validate display index
 	if ($PrimaryDisplayDefault -lt 0 -or $PrimaryDisplayDefault -ge [System.Windows.Forms.Screen]::AllScreens.Count) {
-		Write-Host "Invalid PrimaryDisplayDefault index: $PrimaryDisplayDefault. Defaulting to 1." -ForegroundColor Yellow
+		Write-Console "Invalid PrimaryDisplayDefault index: $PrimaryDisplayDefault. Defaulting to 1." -ForegroundColor Yellow
 		$PrimaryDisplayDefault = 1
 	}
-
-	Write-Host "$(Get-Date): Restoring primary display to $($PrimaryDisplayDefault + 1)..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Restoring primary display to $($PrimaryDisplayDefault + 1)..." -ForegroundColor Cyan
 	Set-PrimaryDisplay ($PrimaryDisplayDefault + 1) # + 1 to make it one-based index for the DisplayConfig module (index: 2)
-	Write-Host "$(Get-Date): Primary display restored to $($PrimaryDisplayDefault + 1)." -ForegroundColor Green
+	Write-Console "$(Get-Date): Primary display restored to $($PrimaryDisplayDefault + 1)." -ForegroundColor Green
 	Add-CompletedTask -Tracker $taskTracker -TaskName 'Primary display restored'
 }
 catch {
@@ -1454,11 +1588,11 @@ catch {
 # =============================
 
 try {
-	Write-Host "$(Get-Date): Checking for OBS..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Checking for OBS..." -ForegroundColor Cyan
 	$ObsProcess = Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue
 
 	if ($ObsProcess) {
-		Write-Host "$(Get-Date): OBS is running. Stopping recording and closing OBS..." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): OBS is running. Stopping recording and closing OBS..." -ForegroundColor Yellow
 
 		try {
 			# Send hotkey to stop recording
@@ -1473,7 +1607,7 @@ try {
 					Write-Error "$(Get-Date): Error activating OBS window or sending stop recording hotkey: $($_.Exception.Message)"
 				}
 			}
-			Write-Host "$(Get-Date): Sent stop recording command to OBS" -ForegroundColor Green
+			Write-Console "$(Get-Date): Sent stop recording command to OBS" -ForegroundColor Green
 
 			# Wait for '==== Recording Stop' in the latest OBS log (mirror start check)
 			$ObsRecordingStopLogMessage = '==== Recording Stop'
@@ -1487,22 +1621,22 @@ try {
 						$logContent = Get-Content $latestLog.FullName -Raw
 						if ($logContent -match [regex]::Escape($ObsRecordingStopLogMessage) -or $logContent -match 'Recording stopped' -or $logContent -match 'Stop recording') {
 							$stopDetected = $true
-							Write-Host "$(Get-Date): OBS recording stop detected in log." -ForegroundColor Green
+							Write-Console "$(Get-Date): OBS recording stop detected in log." -ForegroundColor Green
 							Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS recording stopped, detected in log'
 							break
 						}
 						Start-Sleep -Seconds 1
 					}
 					if (-not $stopDetected) {
-						Write-Host "$(Get-Date): OBS recording stop NOT detected in log after $stopTimeout seconds. Proceeding anyway." -ForegroundColor Yellow
+						Write-Console "$(Get-Date): OBS recording stop NOT detected in log after $stopTimeout seconds. Proceeding anyway." -ForegroundColor Yellow
 					}
 				}
 				else {
-					Write-Host "$(Get-Date): No OBS log files found to check recording stop status." -ForegroundColor Yellow
+					Write-Console "$(Get-Date): No OBS log files found to check recording stop status." -ForegroundColor Yellow
 				}
 			}
 			else {
-				Write-Host "$(Get-Date): OBS log directory not found: $ObsLogDir" -ForegroundColor Yellow
+				Write-Console "$(Get-Date): OBS log directory not found: $ObsLogDir" -ForegroundColor Yellow
 			}
 		}
 		catch {
@@ -1511,7 +1645,7 @@ try {
 
 		try {
 			# Give OBS time to save the recording
-			Write-Host "$(Get-Date): Waiting for recording to save..." -ForegroundColor Cyan
+			Write-Console "$(Get-Date): Waiting for recording to save..." -ForegroundColor Cyan
 			Wait-WithAnimation -Seconds 5 -Message 'Saving recording...'
 		}
 		catch {
@@ -1526,7 +1660,7 @@ try {
 					Start-Sleep -Milliseconds 500
 					# Send the hotkey to close OBS
 					$wshell.SendKeys($CloseObsHotkey)
-					Write-Host "$(Get-Date): Sent close hotkey to OBS window: $($_.MainWindowTitle)" -ForegroundColor Green
+					Write-Console "$(Get-Date): Sent close hotkey to OBS window: $($_.MainWindowTitle)" -ForegroundColor Green
 					Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS recording stopped'
 
 				}
@@ -1542,11 +1676,11 @@ try {
 		try {
 			# Wait for OBS to close naturally (up to 10 seconds)
 			$timeout = 10
-			Write-Host "$(Get-Date): Waiting for OBS to close..." -ForegroundColor Cyan
+			Write-Console "$(Get-Date): Waiting for OBS to close..." -ForegroundColor Cyan
 			Wait-WithAnimation -Seconds $timeout -Message 'Waiting for OBS to close'
 
 			if (Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue) {
-				Write-Host "$(Get-Date): OBS didn't close after $timeout seconds, closing forcefully" -ForegroundColor Yellow
+				Write-Console "$(Get-Date): OBS didn't close after $timeout seconds, closing forcefully" -ForegroundColor Yellow
 				try {
 					Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue | Stop-Process
 				}
@@ -1555,7 +1689,7 @@ try {
 				}
 			}
 			else {
-				Write-Host "$(Get-Date): OBS closed successfully" -ForegroundColor Green
+				Write-Console "$(Get-Date): OBS closed successfully" -ForegroundColor Green
 				Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS closed'
 			}
 		}
@@ -1564,7 +1698,7 @@ try {
 		}
 	}
 	else {
-		Write-Host "$(Get-Date): OBS is not running" -ForegroundColor Yellow
+		Write-Console "$(Get-Date): OBS is not running" -ForegroundColor Yellow
 	}
 }
 catch {
@@ -1576,7 +1710,7 @@ catch {
 # =============================
 
 try {
-	Write-Host "$(Get-Date): Attempting to stop Spotify music and close Spotify after recording..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Attempting to stop Spotify music and close Spotify after recording..." -ForegroundColor Cyan
 	$SpotifyProcess = Get-Process -Name $SpotifyProcessName -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
 	if ($SpotifyProcess) {
 		try {
@@ -1584,14 +1718,14 @@ try {
 			Start-Sleep -Milliseconds 500
 			$wshell = New-Object -ComObject WScript.Shell
 			$wshell.SendKeys(' ')
-			Write-Host "$(Get-Date): Sent Pause hotkey (Spacebar) to Spotify." -ForegroundColor Green
+			Write-Console "$(Get-Date): Sent Pause hotkey (Spacebar) to Spotify." -ForegroundColor Green
 		}
 		catch {
 			Write-Error "$(Get-Date): Error activating Spotify window or sending pause hotkey: $($_.Exception.Message)"
 		}
 		try {
 			$SpotifyProcess | Stop-Process -Force
-			Write-Host "$(Get-Date): Spotify closed successfully after recording." -ForegroundColor Green
+			Write-Console "$(Get-Date): Spotify closed successfully after recording." -ForegroundColor Green
 			Add-CompletedTask -Tracker $taskTracker -TaskName 'Spotify stopped and closed after recording'
 		}
 		catch {
@@ -1599,7 +1733,7 @@ try {
 		}
 	}
 	else {
-		Write-Host "$(Get-Date): Spotify is not running after recording. No action needed." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): Spotify is not running after recording. No action needed." -ForegroundColor Yellow
 	}
 }
 catch {
@@ -1613,15 +1747,15 @@ catch {
 # Run FreeFileSync batch job after Zwift game closes and display is restored to default display (index: 2)
 # This ensures that any files (screenshots) modified during the Zwift session are synchronized with the backup location.
 try {
-	Write-Host "$(Get-Date): Running FreeFileSync batch job..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Running FreeFileSync batch job..." -ForegroundColor Cyan
 	Start-Process -FilePath $FreeFileSyncPath -ArgumentList "`"$BatchJobPath`""
-	Write-Host "$(Get-Date): FreeFileSync batch job started (not waiting for completion)." -ForegroundColor Green
+	Write-Console "$(Get-Date): FreeFileSync batch job started (not waiting for completion)." -ForegroundColor Green
 	Add-CompletedTask -Tracker $taskTracker -TaskName 'FreeFileSync batch job started'
 
 	# Run the second batch job for recordings to NAS
-	Write-Host "$(Get-Date): Running second FreeFileSync batch job (RecordingsToNas)..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Running second FreeFileSync batch job (RecordingsToNas)..." -ForegroundColor Cyan
 	Start-Process -FilePath $FreeFileSyncPath -ArgumentList "`"$BatchJobPath2`""
-	Write-Host "$(Get-Date): Second FreeFileSync batch job started (not waiting for completion)." -ForegroundColor Green
+	Write-Console "$(Get-Date): Second FreeFileSync batch job started (not waiting for completion)." -ForegroundColor Green
 	Add-CompletedTask -Tracker $taskTracker -TaskName 'FreeFileSync batch job 2 started'
 }
 catch {
@@ -1635,17 +1769,17 @@ catch {
 # =============================
 
 try {
-	Write-Host "$(Get-Date): Checking for Spotify..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Checking for Spotify..." -ForegroundColor Cyan
 	$SpotifyProcess = Get-Process -Name $SpotifyProcessName -ErrorAction SilentlyContinue
 
 	if ($SpotifyProcess) {
-		Write-Host "$(Get-Date): Spotify is running. Closing Spotify..." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): Spotify is running. Closing Spotify..." -ForegroundColor Yellow
 		$SpotifyProcess | Stop-Process -Force
-		Write-Host "$(Get-Date): Spotify closed successfully." -ForegroundColor Green
+		Write-Console "$(Get-Date): Spotify closed successfully." -ForegroundColor Green
 		Add-CompletedTask -Tracker $taskTracker -TaskName 'Spotify closed'
 	}
 	else {
-		Write-Host "$(Get-Date): Spotify is not running." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): Spotify is not running." -ForegroundColor Yellow
 	}
 }
 catch {
@@ -1659,9 +1793,9 @@ catch {
 # Check if Microsoft Edge is installed
 if (Test-Path -Path $EdgePath) {
 	try {
-		Write-Host "$(Get-Date): Microsoft Edge found. Launching in app mode with the specified URLs..." -ForegroundColor Cyan
+		Write-Console "$(Get-Date): Microsoft Edge found. Launching in app mode with the specified URLs..." -ForegroundColor Cyan
 		Start-Process -FilePath "$EdgePath" -ArgumentList @("$EdgeUrl1", "$EdgeUrl2", "$EdgeUrl3")
-		Write-Host "$(Get-Date): Microsoft Edge launched successfully with the specified URLs." -ForegroundColor Green
+		Write-Console "$(Get-Date): Microsoft Edge launched successfully with the specified URLs." -ForegroundColor Green
 		Add-CompletedTask -Tracker $taskTracker -TaskName 'Microsoft Edge launched'
 	}
 	catch {
@@ -1669,7 +1803,7 @@ if (Test-Path -Path $EdgePath) {
 	}
 }
 else {
-	Write-Host "$(Get-Date): Microsoft Edge not found at $EdgePath. Skipping launch." -ForegroundColor Yellow
+	Write-Console "$(Get-Date): Microsoft Edge not found at $EdgePath. Skipping launch." -ForegroundColor Yellow
 	Add-CompletedTask -Tracker $taskTracker -TaskName 'Microsoft Edge skipped'
 }
 
@@ -1678,13 +1812,13 @@ else {
 # =============================
 
 try {
-	Write-Host "$(Get-Date): Opening File Explorer with specified directories..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Opening File Explorer with specified directories..." -ForegroundColor Cyan
 	if (Test-Path -Path $ZwiftMediaPath) {
 		Start-Process -FilePath $ExplorerPath -ArgumentList "`"$ZwiftMediaPath`""
 		Add-CompletedTask -Tracker $taskTracker -TaskName 'Opened File Explorer for ZwiftMediaPath'
 	}
 	else {
-		Write-Host "$(Get-Date): Path $ZwiftMediaPath does not exist. Skipping opening File Explorer for this path." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): Path $ZwiftMediaPath does not exist. Skipping opening File Explorer for this path." -ForegroundColor Yellow
 	}
 
 	if (Test-Path -Path $ZwiftPicturesPath) {
@@ -1692,7 +1826,7 @@ try {
 		Add-CompletedTask -Tracker $taskTracker -TaskName 'Opened File Explorer for ZwiftPicturesPath'
 	}
 	else {
-		Write-Host "$(Get-Date): Path $ZwiftPicturesPath does not exist. Skipping the opening of File Explorer for this path." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): Path $ZwiftPicturesPath does not exist. Skipping the opening of File Explorer for this path." -ForegroundColor Yellow
 	}
 
 	$openedPaths = @()
@@ -1703,10 +1837,10 @@ try {
 		$openedPaths += $ZwiftPicturesPath
 	}
 	if ($openedPaths.Count -gt 0) {
-		Write-Host "$(Get-Date): File Explorer opened successfully with the following directories: $($openedPaths -join ', ')." -ForegroundColor Green
+		Write-Console "$(Get-Date): File Explorer opened successfully with the following directories: $($openedPaths -join ', ')." -ForegroundColor Green
 	}
 	else {
-		Write-Host "$(Get-Date): No directories were opened as none of the specified paths exist." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): No directories were opened as none of the specified paths exist." -ForegroundColor Yellow
 	}
 }
 catch {
@@ -1719,18 +1853,18 @@ catch {
 
 try {
 	Set-WindowTransparencyUWP -Transparency 0
-	Write-Host "$(Get-Date): Window transparency reset to fully opaque." -ForegroundColor Green
+	Write-Console "$(Get-Date): Window transparency reset to fully opaque." -ForegroundColor Green
 	Add-CompletedTask -Tracker $taskTracker -TaskName 'Window transparency reset to fully opaque'
 }
 catch {
 	Write-Error "$(Get-Date): Error resetting window transparency: $($_.Exception.Message)"
-	Write-Host "$(Get-Date): Attempting fallback by resetting transparency using default Win32 API..." -ForegroundColor Yellow
+	Write-Console "$(Get-Date): Attempting fallback by resetting transparency using default Win32 API..." -ForegroundColor Yellow
 	try {
 		$hwnd = [Win32]::GetForegroundWindow()
 		$style = [Win32]::GetWindowLong($hwnd, [Win32]::GWL_EXSTYLE)
 		[Win32]::SetWindowLong($hwnd, [Win32]::GWL_EXSTYLE, $style -bor [Win32]::WS_EX_LAYERED)
 		[Win32]::SetLayeredWindowAttributes($hwnd, 0, 255, [Win32]::LWA_ALPHA)
-		Write-Host "$(Get-Date): Fallback succeeded. Window transparency reset to fully opaque using Win32 API." -ForegroundColor Green
+		Write-Console "$(Get-Date): Fallback succeeded. Window transparency reset to fully opaque using Win32 API." -ForegroundColor Green
 		Add-CompletedTask -Tracker $taskTracker -TaskName 'Window transparency reset to fully opaque'
 	}
 	catch {
@@ -1745,13 +1879,13 @@ catch {
 $PowerToysAwakeArgs = "--time-limit $PowerToysAwakeTime --display-on true"
 try {
 	if (Test-Path -LiteralPath $PowerToysAwakePath) {
-		Write-Host "$(Get-Date): Setting PowerToys Awake to on for ($([TimeSpan]::FromSeconds($PowerToysAwakeTime).ToString('hh\:mm\:ss')))..." -ForegroundColor Cyan
+		Write-Console "$(Get-Date): Setting PowerToys Awake to on for ($([TimeSpan]::FromSeconds($PowerToysAwakeTime).ToString('hh\:mm\:ss')))..." -ForegroundColor Cyan
 		Start-Process -FilePath $PowerToysAwakePath -ArgumentList $PowerToysAwakeArgs -WindowStyle Hidden -ErrorAction Stop
-		Write-Host "$(Get-Date): PowerToys Awake settings applied." -ForegroundColor Green
+		Write-Console "$(Get-Date): PowerToys Awake settings applied." -ForegroundColor Green
 		Add-CompletedTask -Tracker $taskTracker -TaskName 'PowerToys Awake set'
 	}
 	else {
-		Write-Host "$(Get-Date): PowerToys Awake executable not found at '$PowerToysAwakePath'. Skipping." -ForegroundColor Yellow
+		Write-Console "$(Get-Date): PowerToys Awake executable not found at '$PowerToysAwakePath'. Skipping." -ForegroundColor Yellow
 		Add-CompletedTask -Tracker $taskTracker -TaskName 'PowerToys Awake skipped'
 	}
 }
@@ -1771,7 +1905,7 @@ try {
 	Invoke-ReviewCountdownAndCleanup -remainingTime $remainingTime
 
 	# --- Add prompt to keep window open after review period or key press ---
-	Write-Host "`n$(Get-Date): Review period complete. Press Enter to close this window..." -ForegroundColor Cyan
+	Write-Console "`n$(Get-Date): Review period complete. Press Enter to close this window..." -ForegroundColor Cyan
 	[void] (Read-Host)
 }
 catch {

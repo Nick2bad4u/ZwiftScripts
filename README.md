@@ -2,6 +2,43 @@
 
 A repo for holding various Zwift scripts, mods, etc
 
+## MonitorZwift (modern / recommended)
+
+The repo now includes a **modernized** Zwift session orchestrator with:
+
+- **Preflight validation** (mandatory vs optional dependencies)
+- **Timeouts everywhere** (no infinite hangs)
+- **try/finally cleanup** (primary display, transparency, PowerToys Awake)
+- **Structured logging** (transcript; optional JSONL)
+- **OBS control via obs-websocket (optional)** (no focus/SendKeys)
+
+### Files
+
+- Entrypoint: `MonitorZwift.ps1`
+- Config: `MonitorZwift.config.json`
+- Module: `modules/ZwiftScripts.Automation/`
+- Logs: `./logs/`
+
+### Run
+
+```powershell
+cd path\to\ZwiftScripts
+.\MonitorZwift.ps1
+```
+
+### Configuration notes
+
+- All display indices in `MonitorZwift.config.json` are **0-based**.
+    - Example: `ZwiftDisplayIndex: 3` means the **4th** Windows display.
+- OBS WebSocket (OBS 28+):
+    1) Enable **Tools > obs-websocket Settings > Enable WebSocket server**
+    2) Set `OBS.WebSocket.Enabled = true`
+    3) Set host/port/password in the config
+
+### Legacy
+
+`MonitorZwift-v2.ps1` remains in the repo as the legacy all-in-one script.
+
 [![ActionLint](https://github.com/Nick2bad4u/ZwiftScripts/actions/workflows/ActionLint.yml/badge.svg)](https://github.com/Nick2bad4u/ZwiftScripts/actions/workflows/ActionLint.yml)
 [![Dependency Review](https://github.com/Nick2bad4u/ZwiftScripts/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/Nick2bad4u/ZwiftScripts/actions/workflows/dependency-review.yml)
 [![Deploy static content to Pages](https://github.com/Nick2bad4u/ZwiftScripts/actions/workflows/static.yml/badge.svg)](https://github.com/Nick2bad4u/ZwiftScripts/actions/workflows/static.yml)
