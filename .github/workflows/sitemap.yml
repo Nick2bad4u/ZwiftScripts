@@ -16,7 +16,7 @@ jobs:
     steps:
       # Step to harden the runner for security purposes
       - name: Harden Runner
-        uses: step-security/harden-runner@95d9a5deda9de15063e7595e9719c11c38c90ae2 # v2.13.2
+        uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
         with:
           disable-sudo: true
           egress-policy: audit
@@ -25,7 +25,7 @@ jobs:
 
       # Step to checkout the repository
       - name: Checkout the repo
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
@@ -47,7 +47,7 @@ jobs:
       # Step to create a pull request with the new sitemap
       - name: Create Pull Request with new SiteMap
         id: create_pr
-        uses: peter-evans/create-pull-request@84ae59a2cdc2258d6fa0732dd66352dddae2a412 # v7.0.9
+        uses: peter-evans/create-pull-request@c0f553fe549906ede9cf27b5156039d195d2ece0 # v8.1.0
         with:
           title: "Automated sitemap update"
           body: >
