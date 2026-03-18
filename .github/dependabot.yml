@@ -10,32 +10,31 @@
 version: 2
 updates:
   - package-ecosystem: github-actions
-
     directory: /
     schedule:
       interval: semiannually
-      time: '05:30'
-      timezone: 'America/Detroit'
+      time: "05:30"
+      timezone: "America/Detroit"
     assignees:
-      - 'Nick2bad4u'
-    target-branch: 'main'
-    rebase-strategy: 'auto'
+      - "Nick2bad4u"
+    target-branch: "main"
+    rebase-strategy: "auto"
     cooldown:
       default-days: 3
     open-pull-requests-limit: 1
-    name: 'GitHub Actions'
+    name: "GitHub Actions"
     versioning-strategy: auto
     allow:
       # Allow both direct and indirect updates for all packages
-      - dependency-type: 'all'
+      - dependency-type: "all"
     labels:
-      - 'github-actions'
+      - "github-actions"
     commit-message:
-      prefix: '[dependabot][all]'
-      prefix-development: '[dependabot][dev][all]'
-      include: 'scope'
+      prefix: "[dependabot][all]"
+      prefix-development: "[dependabot][dev][all]"
+      include: "scope"
     groups:
       github-actions:
         applies-to: version-updates
         patterns:
-          - '*'
+          - "*"
