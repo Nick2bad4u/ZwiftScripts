@@ -1,104 +1,101 @@
 {
-    "Timeouts": {
-        "OnTimeout": "Prompt",
-        "PollSec": 1,
-        "ProcessStartSec": 300,
-        "MainWindowHandleSec": 30,
-        "ZwiftRidingLogSec": 900,
-        "ZwiftSessionMaxSec": 21600
-    },
-    "Display": {
-        "IndicesAreZeroBased": true,
-        "ZwiftDisplayIndex": 3,
-        "DefaultDisplayIndex": 1,
-        "TargetDisplayIndexForConsole": 1
-    },
-    "ConsoleWindow": {
-        "PositionX": 0,
-        "PositionY": 50,
-        "Width": 300,
-        "Height": 600,
-        "TransparencyPercent": 75
-    },
-    "Paths": {
-        "ZwiftLauncherExe": "C:/Program Files (x86)/Zwift/ZwiftLauncher.exe",
-        "FreeFileSyncExe": "C:/Program Files/FreeFileSync/FreeFileSync.exe",
-        "ZwiftPicsBatch": "C:/Users/Nick/Dropbox/Random Save/Task Scheduler Rules/ZwiftPics.ffs_batch",
-        "RecordingsToNasBatch": "C:/Users/Nick/Dropbox/Random Save/Task Scheduler Rules/RecordingsToNas.ffs_batch",
-        "ZwiftLog": "C:/Users/Nick/Dropbox/PC (2)/Documents/Zwift/Logs/Log.txt",
-        "ZwiftMediaDir": "C:/Users/Nick/Dropbox/Cycling/ZwiftMedia",
-        "ZwiftPicturesDir": "C:/Users/Nick/Dropbox/PC (2)/Pictures/Zwift",
-        "EdgeExe": "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-        "PowerToysExe": "C:/Program Files/PowerToys/PowerToys.exe",
-        "PowerToysWorkspacesLauncherExe": "C:/Program Files/PowerToys/PowerToys.WorkspacesLauncher.exe",
-        "PowerToysAwakeExe": "C:/Program Files/PowerToys/PowerToys.Awake.exe",
-        "ObsExe": "C:/Program Files/obs-studio/bin/64bit/obs64.exe",
-        "ObsLogDir": "%APPDATA%/obs-studio/logs"
-    },
-    "Processes": {
-        "ZwiftGameProcessName": "ZwiftApp",
-        "ZwiftLauncherProcessName": "ZwiftLauncher",
-        "ObsProcessName": "obs64",
-        "SpotifyProcessName": "Spotify",
-        "Sauce": {
-            "PreferredProcessName": null,
-            "WindowTitleRegex": "Sauce",
-            "CommandLineRegex": "Sauce"
-        }
-    },
-    "PowerToys": {
-        "WorkspaceGuid": "{E2CDEA2A-6E33-4CFD-A26B-0C5CC2E55F40}",
-        "LaunchWorkspacesIfAppsMissing": [
-            "Spotify",
-            "obs64"
-        ],
-        "Awake": {
-            "Enabled": true,
-            "Hours": 3,
-            "DisplayOn": true
-        }
-    },
-    "OBS": {
-        "WebSocket": {
-            "Enabled": false,
-            "Host": "127.0.0.1",
-            "Port": 4455,
-            "Password": "",
-            "ConnectTimeoutSec": 10
-        },
-        "Hotkeys": {
-            "RecordingToggle": "^{F11}",
-            "CloseObs": "%{F4}"
-        },
-        "RecordingStartLogMessage": "==== Recording Start",
-        "RecordingStopLogMessage": "==== Recording Stop"
-    },
-    "Spotify": {
-        "UseGlobalMediaPlayPause": true
-    },
-    "Browser": {
-        "LaunchEdge": true,
-        "UseAppMode": true,
-        "Urls": [
-            "https://studio.youtube.com/channel/UCyYwMWui3Opy2yZyom2QM0g/videos/upload?filter=%5B%5D&sort=%7B%22columnType%22%3A%22date%22%2C%22sortOrder%22%3A%22DESCENDING%22%7D",
-            "https://www.strava.com/athlete/training",
-            "https://connect.garmin.com/modern/home"
-        ]
-    },
-    "FileExplorer": {
-        "OpenFolders": true
-    },
-    "FreeFileSync": {
-        "RunOnExit": true
-    },
-    "Logging": {
-        "Transcript": {
-            "Enabled": true,
-            "Directory": "./logs"
-        },
-        "Json": {
-            "Enabled": false,
-            "Directory": "./logs"
-        }
-    }
+	"Timeouts": {
+		"OnTimeout": "Prompt",
+		"PollSec": 1,
+		"ProcessStartSec": 300,
+		"MainWindowHandleSec": 30,
+		"ZwiftRidingLogSec": 900,
+		"ZwiftSessionMaxSec": 21600
+	},
+	"Display": {
+		"IndicesAreZeroBased": true,
+		"ZwiftDisplayIndex": 3,
+		"DefaultDisplayIndex": 1,
+		"TargetDisplayIndexForConsole": 1
+	},
+	"ConsoleWindow": {
+		"PositionX": 0,
+		"PositionY": 50,
+		"Width": 300,
+		"Height": 600,
+		"TransparencyPercent": 75
+	},
+	"Paths": {
+		"ZwiftLauncherExe": "C:/Program Files (x86)/Zwift/ZwiftLauncher.exe",
+		"FreeFileSyncExe": "C:/Program Files/FreeFileSync/FreeFileSync.exe",
+		"ZwiftPicsBatch": "C:/Users/Nick/Dropbox/Random Save/Task Scheduler Rules/ZwiftPics.ffs_batch",
+		"RecordingsToNasBatch": "C:/Users/Nick/Dropbox/Random Save/Task Scheduler Rules/RecordingsToNas.ffs_batch",
+		"ZwiftLog": "C:/Users/Nick/AppData/Local/Zwift/logs/Log.txt",
+		"ZwiftMediaDir": "C:/Users/Nick/Dropbox/Cycling/ZwiftMedia",
+		"ZwiftPicturesDir": "C:/Users/Nick/Dropbox/PC (2)/Pictures/Zwift",
+		"EdgeExe": "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+		"PowerToysExe": "C:/Program Files/PowerToys/PowerToys.exe",
+		"PowerToysWorkspacesLauncherExe": "C:/Program Files/PowerToys/PowerToys.WorkspacesLauncher.exe",
+		"PowerToysAwakeExe": "C:/Program Files/PowerToys/PowerToys.Awake.exe",
+		"ObsExe": "C:/Program Files/obs-studio/bin/64bit/obs64.exe",
+		"ObsLogDir": "%APPDATA%/obs-studio/logs"
+	},
+	"Processes": {
+		"ZwiftGameProcessName": "ZwiftApp",
+		"ZwiftLauncherProcessName": "ZwiftLauncher",
+		"ObsProcessName": "obs64",
+		"SpotifyProcessName": "Spotify",
+		"Sauce": {
+			"PreferredProcessName": null,
+			"WindowTitleRegex": "Sauce",
+			"CommandLineRegex": "Sauce"
+		}
+	},
+	"PowerToys": {
+		"WorkspaceGuid": "{E2CDEA2A-6E33-4CFD-A26B-0C5CC2E55F40}",
+		"LaunchWorkspacesIfAppsMissing": ["Spotify", "obs64"],
+		"Awake": {
+			"Enabled": true,
+			"Hours": 3,
+			"DisplayOn": true
+		}
+	},
+	"OBS": {
+		"WebSocket": {
+			"Enabled": true,
+			"Host": "192.168.1.223",
+			"Port": 4455,
+			"Password": "8k7E7nG2UVVHgJBP",
+			"ConnectTimeoutSec": 10
+		},
+		"Hotkeys": {
+			"RecordingToggle": "^{F11}",
+			"CloseObs": "%{F4}"
+		},
+		"RecordingStartLogMessage": "==== Recording Start",
+		"RecordingStopLogMessage": "==== Recording Stop"
+	},
+	"Spotify": {
+		"UseGlobalMediaPlayPause": true
+	},
+	"Browser": {
+		"LaunchEdge": true,
+		"UseAppMode": true,
+		"Urls": [
+			"https://studio.youtube.com/channel/UCyYwMWui3Opy2yZyom2QM0g/videos/upload?filter=%5B%5D&sort=%7B%22columnType%22%3A%22date%22%2C%22sortOrder%22%3A%22DESCENDING%22%7D",
+			"https://www.strava.com/athlete/training",
+			"https://connect.garmin.com/modern/home"
+		]
+	},
+	"FileExplorer": {
+		"OpenFolders": true
+	},
+	"FreeFileSync": {
+		"RunOnExit": true
+	},
+	"Logging": {
+		"Transcript": {
+			"Enabled": true,
+			"Directory": "./logs"
+		},
+		"Json": {
+			"Enabled": false,
+			"Directory": "./logs"
+		}
+	}
 }

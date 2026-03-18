@@ -218,6 +218,148 @@ function Get-IsInteractive {
   }
 }
 
+function Add-CompletedTask {
+  param(
+    [hashtable]$Tracker,
+    [string]$TaskName
+  )
+
+  if (-not $Tracker -or [string]::IsNullOrWhiteSpace($TaskName)) { return }
+  if (-not $Tracker.ContainsKey('CompletedTasks') -or -not $Tracker.CompletedTasks) {
+    $Tracker.CompletedTasks = New-Object System.Collections.ArrayList
+  }
+  [void]$Tracker.CompletedTasks.Add($TaskName)
+}
+
+function Show-TaskCompletionSummary {
+  param(
+    [hashtable]$Tracker
+  )
+
+  $completedOrdered = @($Tracker.CompletedTasks)
+  Write-ZwiftLog -Level Info -Message 'Task Completion Summary (in order completed):' -ForegroundColor Cyan
+  foreach ($task in $completedOrdered) {
+    Write-ZwiftLog -Level Info -Message "- ${task}: Completed" -ForegroundColor Green
+  }
+}
+
+function Write-TransientStatusLine {
+  param([string]$Message)
+
+  try {
+    if ($Host -and $Host.UI -and $Host.UI.RawUI) {
+      $width = [Math]::Max(80, [int]$Host.UI.RawUI.WindowSize.Width)
+      $text = if ([string]::IsNullOrEmpty($Message)) { '' } else { $Message }
+      $Host.UI.Write("`r" + $text.PadRight($width - 1))
+    } elseif ($Message) {
+      Write-Output $Message
+    }
+  } catch {
+    if ($Message) { Write-Output $Message }
+  }
+}
+
+function Get-ReviewRemainingTime {
+  param(
+    [double]$Hours,
+    [int]$Minutes,
+    [int]$Seconds
+  )
+
+  if ($null -ne $Hours -and $Hours -gt 0) {
+    return [int][Math]::Round($Hours * 3600)
+  }
+  if ($null -ne $Minutes -and $Minutes -gt 0) {
+    return $Minutes * 60
+  }
+  if ($null -ne $Seconds -and $Seconds -gt 0) {
+    return $Seconds
+  }
+  return 0
+}
+
+function Read-YesNoWithTimeout {
+  param(
+    [Parameter(Mandatory)] [string]$Prompt,
+    [int]$TimeoutSec = 15,
+    [ValidateSet('Y','N')]
+    [string]$Default = 'N'
+  )
+
+  if (-not (Get-IsInteractive)) { return $Default }
+
+  $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSec))
+  while ((Get-Date) -lt $deadline) {
+    $remaining = [int][Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds)
+    Write-TransientStatusLine -Message "$Prompt [Y/N] (default: $Default in ${remaining}s)"
+    Start-Sleep -Milliseconds 200
+
+    try {
+      if ([Console]::KeyAvailable) {
+        $key = [Console]::ReadKey($true)
+        switch ($key.Key) {
+          'Y' { Write-TransientStatusLine -Message ''; Write-Output ''; return 'Y' }
+          'N' { Write-TransientStatusLine -Message ''; Write-Output ''; return 'N' }
+          'Enter' { Write-TransientStatusLine -Message ''; Write-Output ''; return $Default }
+        }
+      }
+    } catch {
+      break
+    }
+  }
+
+  Write-TransientStatusLine -Message ''
+  Write-Output ''
+  return $Default
+}
+
+function Invoke-ReviewCountdown {
+  param(
+    [int]$RemainingTimeSec
+  )
+
+  if ($RemainingTimeSec -le 0) { return }
+
+  try {
+    $initial = $RemainingTimeSec
+    Write-ZwiftLog -Level Info -Message "Script execution completed. The window will remain open for review for $([TimeSpan]::FromSeconds($RemainingTimeSec).ToString('hh\:mm\:ss'))." -ForegroundColor Yellow
+    $exitEarly = $false
+
+    while ($RemainingTimeSec -gt 0) {
+      try {
+        if (Get-IsInteractive) {
+          if ([Console]::KeyAvailable) {
+            $null = [Console]::ReadKey($true)
+            Write-TransientStatusLine -Message ''
+            Write-Output ''
+            Write-ZwiftLog -Level Info -Message 'Key press detected. Exiting review countdown early.' -ForegroundColor Yellow
+            $exitEarly = $true
+            break
+          }
+        }
+
+        $formatted = [TimeSpan]::FromSeconds($RemainingTimeSec).ToString('hh\:mm\:ss')
+        Write-TransientStatusLine -Message "Time remaining: $formatted"
+        Start-Sleep -Seconds 1
+        $RemainingTimeSec--
+      } catch {
+        Write-ZwiftLog -Level Warn -Message "Error during review countdown: $($_.Exception.Message)"
+        break
+      }
+    }
+
+    Write-TransientStatusLine -Message ''
+    Write-Output ''
+
+    if (-not $exitEarly) {
+      Write-ZwiftLog -Level Info -Message "Script review time over. $([TimeSpan]::FromSeconds($initial).ToString('hh\:mm\:ss')) has passed since the script ended." -ForegroundColor Yellow
+      Write-ZwiftLog -Level Info -Message 'Closing the script now.' -ForegroundColor Yellow
+    }
+  } catch {
+    Write-ZwiftLog -Level Warn -Message "Error during script review countdown: $($_.Exception.Message)"
+  }
+}
+
 function Wait-Until {
   [CmdletBinding()]
   param(
@@ -332,6 +474,32 @@ function Test-LogPatternMatch {
   return $false
 }
 
+function Test-ManualOverrideKeyPressed {
+  [CmdletBinding()]
+  param(
+    [System.ConsoleKey]$OverrideKey = [System.ConsoleKey]::F8,
+    [string]$Description = 'the current wait'
+  )
+
+  if (-not (Get-IsInteractive)) {
+    return $false
+  }
+
+  try {
+    while ([Console]::KeyAvailable) {
+      $keyInfo = [Console]::ReadKey($true)
+      if ($keyInfo.Key -eq $OverrideKey) {
+        Write-ZwiftLog -Level Warn -Message "Manual override key '$OverrideKey' pressed while waiting for $Description. Continuing."
+        return $true
+      }
+    }
+  } catch {
+    Write-Verbose "Manual override key check failed: $($_.Exception.Message)"
+  }
+
+  return $false
+}
+
 function Wait-ForLogPatterns {
   [CmdletBinding()]
   param(
@@ -341,6 +509,7 @@ function Wait-ForLogPatterns {
     [int]$PollSec = 1,
     [int]$InitialTailLines = 2000,
     [string]$Description = 'log pattern',
+    [System.ConsoleKey]$ManualOverrideKey = [System.ConsoleKey]::F8,
     [ValidateSet('Prompt','Continue','Abort')]
     [string]$OnTimeout = 'Prompt'
   )
@@ -369,6 +538,10 @@ function Wait-ForLogPatterns {
     $null = $reader.BaseStream.Seek(0, [System.IO.SeekOrigin]::End)
 
     return (Wait-Until -TimeoutSec $TimeoutSec -PollSec $PollSec -OnTimeout $OnTimeout -Description $Description -Condition {
+      if (Test-ManualOverrideKeyPressed -OverrideKey $ManualOverrideKey -Description $Description) {
+        return $true
+      }
+
       while ($null -ne ($line = $reader.ReadLine())) {
         foreach ($pattern in $Patterns) {
           if ($line -match $pattern) {
@@ -407,6 +580,9 @@ public static class ZwiftWin32Window {
   public static extern IntPtr GetForegroundWindow();
 
   [DllImport("user32.dll", SetLastError = true)]
+  public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+  [DllImport("user32.dll", SetLastError = true)]
   public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
 
   [DllImport("user32.dll", SetLastError = true)]
@@ -428,6 +604,7 @@ public static class ZwiftWin32Window {
   public const uint SWP_NOZORDER = 0x0004;
   public const uint SWP_SHOWWINDOW = 0x0040;
 
+  public const int SW_SHOW = 5;
   public const int SW_MAXIMIZE = 3;
 }
 '@
@@ -523,6 +700,99 @@ function Set-ProcessMainWindowState {
       return $true
     } catch {
       Write-ZwiftLog -Level Warn -Message "Failed to set window state: $($_.Exception.Message)"
+      return $false
+    }
+  }
+
+  return $false
+}
+
+function Set-ProcessWindowOnDisplay {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param(
+    [Parameter(Mandatory)] [System.Diagnostics.Process]$Process,
+    [Parameter(Mandatory)] [int]$DisplayIndex,
+    [ValidateRange(0.1,1.0)]
+    [double]$WidthPercent = 0.8,
+    [ValidateRange(0.1,1.0)]
+    [double]$HeightPercent = 0.8
+  )
+
+  Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+  Initialize-Win32WindowInterop
+
+  $hWnd = $Process.MainWindowHandle
+  if ($hWnd -eq 0) { return $false }
+
+  $screens = [System.Windows.Forms.Screen]::AllScreens
+  if ($DisplayIndex -lt 0 -or $DisplayIndex -ge $screens.Count) {
+    Write-ZwiftLog -Level Warn -Message "Invalid display index for process placement: $DisplayIndex"
+    return $false
+  }
+
+  $wa = $screens[$DisplayIndex].WorkingArea
+  $width = [int]($wa.Width * $WidthPercent)
+  $height = [int]($wa.Height * $HeightPercent)
+  $x = $wa.X + [int](($wa.Width - $width) / 2)
+  $y = $wa.Y + [int](($wa.Height - $height) / 2)
+
+  if ($PSCmdlet.ShouldProcess($Process.ProcessName, "Move/resize to display $DisplayIndex centered at $x,$y size ${width}x${height}")) {
+    try {
+      [void][ZwiftWin32Window]::SetWindowPos($hWnd, [IntPtr]::Zero, $x, $y, $width, $height, [ZwiftWin32Window]::SWP_NOZORDER -bor [ZwiftWin32Window]::SWP_SHOWWINDOW)
+      [void][ZwiftWin32Window]::ShowWindow($hWnd, [ZwiftWin32Window]::SW_SHOW)
+      return $true
+    } catch {
+      Write-ZwiftLog -Level Warn -Message "Failed to move/resize process window: $($_.Exception.Message)"
+      return $false
+    }
+  }
+
+  return $false
+}
+
+function Set-ProcessWindowFocus {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param(
+    [Parameter(Mandatory)] [System.Diagnostics.Process]$Process
+  )
+
+  Initialize-Win32WindowInterop
+  $hWnd = $Process.MainWindowHandle
+  if ($hWnd -eq 0) { return $false }
+
+  if ($PSCmdlet.ShouldProcess($Process.ProcessName, 'Focus process main window')) {
+    try {
+      [void][ZwiftWin32Window]::ShowWindow($hWnd, [ZwiftWin32Window]::SW_SHOW)
+      Start-Sleep -Milliseconds 200
+      return [ZwiftWin32Window]::SetForegroundWindow($hWnd)
+    } catch {
+      Write-ZwiftLog -Level Warn -Message "Failed to focus process window: $($_.Exception.Message)"
+      return $false
+    }
+  }
+
+  return $false
+}
+
+function Send-SpacebarToProcess {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param(
+    [Parameter(Mandatory)] [System.Diagnostics.Process]$Process,
+    [string]$Description = 'Send spacebar to process'
+  )
+
+  if (-not $Process -or $Process.HasExited) { return $false }
+
+  if ($PSCmdlet.ShouldProcess($Process.ProcessName, $Description)) {
+    try {
+      $focused = Set-ProcessWindowFocus -Process $Process
+      if (-not $focused) { return $false }
+      Start-Sleep -Milliseconds 500
+      $wshell = New-Object -ComObject WScript.Shell
+      $wshell.SendKeys(' ')
+      return $true
+    } catch {
+      Write-ZwiftLog -Level Warn -Message "Failed sending spacebar to process: $($_.Exception.Message)"
       return $false
     }
   }
@@ -857,6 +1127,70 @@ function Disconnect-ObsWebSocket {
   try { $WebSocket.Dispose() } catch { Write-Verbose "OBS WebSocket dispose failed: $($_.Exception.Message)" }
 }
 
+function Start-ObsApplication {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param(
+    [Parameter(Mandatory)] [string]$ObsExe
+  )
+
+  $exe = Resolve-ConfigPath $ObsExe
+  if (-not $exe -or -not (Test-Path -LiteralPath $exe)) {
+    Write-ZwiftLog -Level Warn -Message "OBS executable not found: $exe"
+    return $false
+  }
+
+  if ($PSCmdlet.ShouldProcess($exe, 'Start OBS application')) {
+    try {
+      Start-Process -FilePath $exe | Out-Null
+      Write-ZwiftLog -Level Info -Message "Started OBS: $exe"
+      return $true
+    } catch {
+      Write-ZwiftLog -Level Warn -Message "Failed to start OBS: $($_.Exception.Message)"
+      return $false
+    }
+  }
+
+  return $false
+}
+
+function Stop-ObsApplicationProcess {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param(
+    [Parameter(Mandatory)] [string]$ProcessName,
+    [int]$WaitSec = 10
+  )
+
+  $obsProc = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $obsProc) { return $true }
+
+  if ($PSCmdlet.ShouldProcess($ProcessName, 'Close OBS application window')) {
+    try {
+      $null = $obsProc.CloseMainWindow()
+    } catch {
+      Write-Verbose "OBS CloseMainWindow failed: $($_.Exception.Message)"
+    }
+  }
+
+  $closed = Wait-Until -TimeoutSec $WaitSec -PollSec 1 -OnTimeout Continue -Description 'OBS process to exit' -Condition {
+    -not (Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+  }
+
+  if ($closed) { return $true }
+
+  $remaining = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue
+  if ($remaining -and $PSCmdlet.ShouldProcess($ProcessName, 'Force-stop OBS process')) {
+    try {
+      $remaining | Stop-Process -Force -ErrorAction Stop
+      return $true
+    } catch {
+      Write-ZwiftLog -Level Warn -Message "Failed to force-stop OBS: $($_.Exception.Message)"
+      return $false
+    }
+  }
+
+  return $false
+}
+
 # =============================
 # Process matching (avoid "name with spaces")
 # =============================
@@ -1021,8 +1355,10 @@ function Invoke-MonitorZwift {
   $changedPrimary = $false
   $awakeStarted = $false
   $transparencyApplied = $false
+  $taskTracker = @{ CompletedTasks = (New-Object System.Collections.ArrayList) }
 
   $obsWs = $null
+  $obsStartedHere = $false
 
   try {
     Write-ZwiftLog -Level Info -Message "Original primary display index (0-based): $originalPrimaryDisplay"
@@ -1036,7 +1372,11 @@ function Invoke-MonitorZwift {
   # Window management (best-effort) + MUST-RESTORE in finally
   try {
     $null = Set-HostWindowPosition -DisplayIndex $Config.Display.TargetDisplayIndexForConsole -X $Config.ConsoleWindow.PositionX -Y $Config.ConsoleWindow.PositionY -Width $Config.ConsoleWindow.Width -Height $Config.ConsoleWindow.Height
+    Add-CompletedTask -Tracker $taskTracker -TaskName 'Resized and positioned PowerShell window'
     $transparencyApplied = Set-HostWindowTransparency -TransparencyPercent $Config.ConsoleWindow.TransparencyPercent
+    if ($transparencyApplied) {
+      Add-CompletedTask -Tracker $taskTracker -TaskName 'Set Window Transparency'
+    }
   } catch {
     Write-ZwiftLog -Level Warn -Message "Host window management failed: $($_.Exception.Message)"
   }
@@ -1046,7 +1386,14 @@ function Invoke-MonitorZwift {
     $seconds = [int]($Config.PowerToys.Awake.Hours * 3600)
     if ($seconds -gt 0) {
       $awakeStarted = Start-PowerToysAwake -AwakeExe $Config.Paths.PowerToysAwakeExe -Seconds $seconds -DisplayOn ([bool]$Config.PowerToys.Awake.DisplayOn)
+      if ($awakeStarted) {
+        Add-CompletedTask -Tracker $taskTracker -TaskName 'PowerToys Awake set'
+      } else {
+        Add-CompletedTask -Tracker $taskTracker -TaskName 'PowerToys Awake failed'
+      }
     }
+  } else {
+    Add-CompletedTask -Tracker $taskTracker -TaskName 'PowerToys Awake skipped'
   }
 
     # (Optional) set transparency early
@@ -1062,12 +1409,17 @@ function Invoke-MonitorZwift {
     } else {
       Write-ZwiftLog -Level Info -Message 'Zwift game already running; skipping launcher start.'
     }
+    Add-CompletedTask -Tracker $taskTracker -TaskName 'ZwiftApp already running or Zwift Launcher started'
 
     # Wait for launcher
     $launcherProc = Wait-ForProcess -ProcessName $Config.Processes.ZwiftLauncherProcessName -TimeoutSec $Config.Timeouts.ProcessStartSec -PollSec $pollSec -OnTimeout $Config.Timeouts.OnTimeout
     if ($launcherProc) {
+      Add-CompletedTask -Tracker $taskTracker -TaskName 'Zwift launcher running'
       # Switch primary display to Zwift display
       $changedPrimary = Set-PrimaryDisplaySafe -ZeroBasedIndex $Config.Display.ZwiftDisplayIndex
+      if ($changedPrimary) {
+        Add-CompletedTask -Tracker $taskTracker -TaskName 'Primary display set for Zwift'
+      }
     }
 
     # PowerToys Workspaces (optional)
@@ -1082,6 +1434,7 @@ function Invoke-MonitorZwift {
         Start-Process -FilePath $wsLauncher -ArgumentList "${($Config.PowerToys.WorkspaceGuid)} 1" | Out-Null
       }
     }
+    Add-CompletedTask -Tracker $taskTracker -TaskName 'PowerToys Workspaces launched or skipped'
 
     # Wait for Zwift game start
     $zwiftProc = Wait-ForProcess -ProcessName $Config.Processes.ZwiftGameProcessName -TimeoutSec $Config.Timeouts.ProcessStartSec -PollSec $pollSec -OnTimeout $Config.Timeouts.OnTimeout
@@ -1089,44 +1442,53 @@ function Invoke-MonitorZwift {
       Write-ZwiftLog -Level Warn -Message 'Zwift game did not start within timeout. Continuing with cleanup safeguards only.'
       return
     }
+    Add-CompletedTask -Tracker $taskTracker -TaskName 'Zwift game started'
 
   # Harden window-handle logic: wait for Zwift main window handle then maximize
   try {
     $null = Wait-ForMainWindowHandle -Process $zwiftProc -TimeoutSec $Config.Timeouts.MainWindowHandleSec -PollSec $pollSec -OnTimeout $Config.Timeouts.OnTimeout
     # refresh process object
     $zwiftProc = Get-Process -Id $zwiftProc.Id -ErrorAction SilentlyContinue
-    if ($zwiftProc) { $null = Set-ProcessMainWindowState -Process $zwiftProc -State 'Maximize' }
+    if ($zwiftProc) {
+      $null = Set-ProcessMainWindowState -Process $zwiftProc -State 'Maximize'
+      Add-CompletedTask -Tracker $taskTracker -TaskName 'Zwift game window maximized'
+    }
   } catch {
     Write-ZwiftLog -Level Warn -Message "Zwift window maximize failed: $($_.Exception.Message)"
   }
 
-    # Optional: OBS websocket connect (preferred)
-    if ($Config.OBS.WebSocket.Enabled) {
+    # Step 10 parity: move OBS if already running; otherwise wait until ride start to prompt.
+    $obsProc = Get-Process -Name $Config.Processes.ObsProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($obsProc) {
       try {
-        $secPw = $null
-        if ($Config.OBS.WebSocket.Password) {
-          # NOTE: config stores the password as plaintext; we immediately convert to SecureString for API calls.
-          $secPw = ConvertTo-SecureString -String $Config.OBS.WebSocket.Password -AsPlainText -Force
+        $null = Wait-ForMainWindowHandle -Process $obsProc -TimeoutSec $Config.Timeouts.MainWindowHandleSec -PollSec $pollSec -OnTimeout Continue
+        $obsProc = Get-Process -Id $obsProc.Id -ErrorAction SilentlyContinue
+        if ($obsProc) {
+          $null = Set-ProcessWindowOnDisplay -Process $obsProc -DisplayIndex $Config.Display.ZwiftDisplayIndex -WidthPercent 0.8 -HeightPercent 0.8
+          Write-ZwiftLog -Level Info -Message 'OBS positioned on Zwift display.'
+          Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS moved to Zwift monitor and centered/resized'
         }
-        $obsWs = Connect-ObsWebSocket -ObsHost $Config.OBS.WebSocket.Host -Port $Config.OBS.WebSocket.Port -Password $secPw -ConnectTimeoutSec $Config.OBS.WebSocket.ConnectTimeoutSec
-        Write-ZwiftLog -Level Info -Message 'Connected to OBS WebSocket.'
       } catch {
-        Write-ZwiftLog -Level Warn -Message "OBS WebSocket connect failed; will fall back to legacy hotkeys if needed: $($_.Exception.Message)"
+        Write-ZwiftLog -Level Warn -Message "OBS window positioning failed: $($_.Exception.Message)"
       }
+    } else {
+      Write-ZwiftLog -Level Info -Message 'OBS is not running yet. Will prompt to start it after ride start.'
     }
 
-    # Spotify: global media play/pause (no focus required)
-    if ($Config.Spotify.UseGlobalMediaPlayPause) {
-      if (Get-Process -Name $Config.Processes.SpotifyProcessName -ErrorAction SilentlyContinue) {
-        Write-ZwiftLog -Level Info -Message 'Toggling Spotify Play/Pause via global media key.'
-        Send-MediaPlayPause
+    # Spotify: mirror legacy v2 behavior by focusing Spotify and sending Space.
+    $spotifyStartProc = Get-Process -Name $Config.Processes.SpotifyProcessName -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+    if ($spotifyStartProc) {
+      Write-ZwiftLog -Level Info -Message 'Spotify is running. Focusing window and sending Play hotkey (Spacebar)...'
+      if (Send-SpacebarToProcess -Process $spotifyStartProc -Description 'Send Play hotkey (Spacebar) to Spotify') {
+        Write-ZwiftLog -Level Info -Message 'Sent Play hotkey (Spacebar) to Spotify.'
+        Add-CompletedTask -Tracker $taskTracker -TaskName 'Spotify play hotkey sent'
       }
     }
 
     # Wait for ride start marker (optional)
     $zwiftLog = Resolve-ConfigPath $Config.Paths.ZwiftLog
     if ($zwiftLog -and (Test-Path -LiteralPath $zwiftLog)) {
-      Write-ZwiftLog -Level Info -Message 'Waiting for Zwift log ride-start markers...'
+      Write-ZwiftLog -Level Info -Message 'Waiting for Zwift log ride-start markers... Press F8 to continue manually.'
       $rideStartPatterns = @(
         '\\[ZWATCHDOG\\]: GameFlowState Riding',
         'INFO LEVEL: \\[GameState\\] Starting Ride\\.',
@@ -1135,22 +1497,69 @@ function Invoke-MonitorZwift {
       $ok = Wait-ForLogPatterns -LiteralPath $zwiftLog -Patterns $rideStartPatterns -TimeoutSec $Config.Timeouts.ZwiftRidingLogSec -PollSec $pollSec -OnTimeout $Config.Timeouts.OnTimeout -InitialTailLines 2000 -Description 'Zwift ride start in log'
       if ($ok) {
         Write-ZwiftLog -Level Info -Message 'Ride start detected.'
+        Add-CompletedTask -Tracker $taskTracker -TaskName 'Ride start detected'
       }
     }
 
     # OBS recording start (API-first)
+    $obsProc = Get-Process -Name $Config.Processes.ObsProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $obsProc) {
+      Write-ZwiftLog -Level Warn -Message 'OBS is NOT running!'
+      $startChoice = Read-YesNoWithTimeout -Prompt 'Would you like to start OBS now?' -TimeoutSec 15 -Default 'N'
+      if ($startChoice -eq 'Y') {
+        $obsStartedHere = Start-ObsApplication -ObsExe $Config.Paths.ObsExe
+        if ($obsStartedHere) {
+          $obsProc = Wait-ForProcess -ProcessName $Config.Processes.ObsProcessName -TimeoutSec 30 -PollSec $pollSec -OnTimeout Continue
+          if ($obsProc) {
+            Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS started after user prompt'
+            try {
+              $null = Wait-ForMainWindowHandle -Process $obsProc -TimeoutSec $Config.Timeouts.MainWindowHandleSec -PollSec $pollSec -OnTimeout Continue
+              $obsProc = Get-Process -Id $obsProc.Id -ErrorAction SilentlyContinue
+              if ($obsProc) {
+                $null = Set-ProcessWindowOnDisplay -Process $obsProc -DisplayIndex $Config.Display.ZwiftDisplayIndex -WidthPercent 0.8 -HeightPercent 0.8
+                Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS moved to Zwift monitor and centered/resized'
+              }
+            } catch {
+              Write-ZwiftLog -Level Warn -Message "OBS window positioning after prompt failed: $($_.Exception.Message)"
+            }
+          }
+        }
+      } else {
+        Write-ZwiftLog -Level Warn -Message 'OBS will not be started automatically. Recording will be skipped unless OBS is started manually.'
+      }
+    } else {
+      Write-ZwiftLog -Level Info -Message 'OBS is already running.'
+    }
+
+    if (-not $obsWs -and $obsProc -and $Config.OBS.WebSocket.Enabled) {
+      try {
+        $secPw = $null
+        if ($Config.OBS.WebSocket.Password) {
+          $secPw = ConvertTo-SecureString -String $Config.OBS.WebSocket.Password -AsPlainText -Force
+        }
+        $obsWs = Connect-ObsWebSocket -ObsHost $Config.OBS.WebSocket.Host -Port $Config.OBS.WebSocket.Port -Password $secPw -ConnectTimeoutSec $Config.OBS.WebSocket.ConnectTimeoutSec
+        Write-ZwiftLog -Level Info -Message 'Connected to OBS WebSocket.'
+      } catch {
+        Write-ZwiftLog -Level Warn -Message "OBS WebSocket connect failed: $($_.Exception.Message)"
+      }
+    }
+
     if ($obsWs) {
       try {
         $status = Get-ObsRecordStatus -WebSocket $obsWs
         if (-not $status.outputActive) {
           Write-ZwiftLog -Level Info -Message 'Starting OBS recording via WebSocket.'
           Start-ObsRecordingApi -WebSocket $obsWs
+          Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS recording started'
         } else {
           Write-ZwiftLog -Level Info -Message 'OBS recording already active (WebSocket).'
+          Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS recording already started, detected in log'
         }
       } catch {
         Write-ZwiftLog -Level Warn -Message "OBS recording control via WebSocket failed: $($_.Exception.Message)"
       }
+    } elseif ($obsProc) {
+      Write-ZwiftLog -Level Warn -Message 'OBS is running but WebSocket is not connected, so recording start was skipped.'
     }
 
     # Wait for Zwift game to close (bounded)
@@ -1160,13 +1569,17 @@ function Invoke-MonitorZwift {
     }
 
     Write-ZwiftLog -Level Info -Message 'Zwift session ended.'
+    Add-CompletedTask -Tracker $taskTracker -TaskName 'Zwift game closed'
 
   } finally {
     # MUST-RESTORE CLEANUP
 
   # Best-effort: reset host window transparency to opaque
   if ($transparencyApplied) {
-    try { $null = Set-HostWindowTransparency -TransparencyPercent 0 } catch { Write-Verbose "Reset transparency failed: $($_.Exception.Message)" }
+    try {
+      $null = Set-HostWindowTransparency -TransparencyPercent 0
+      Add-CompletedTask -Tracker $taskTracker -TaskName 'Window transparency reset to fully opaque'
+    } catch { Write-Verbose "Reset transparency failed: $($_.Exception.Message)" }
   }
 
     # Stop OBS recording (API-first)
@@ -1176,6 +1589,7 @@ function Invoke-MonitorZwift {
         if ($status.outputActive) {
           Write-ZwiftLog -Level Info -Message 'Stopping OBS recording via WebSocket.'
           Stop-ObsRecordingApi -WebSocket $obsWs
+          Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS recording stopped'
         }
       } catch {
         Write-ZwiftLog -Level Warn -Message "Failed stopping OBS recording via WebSocket: $($_.Exception.Message)"
@@ -1185,10 +1599,24 @@ function Invoke-MonitorZwift {
       Disconnect-ObsWebSocket -WebSocket $obsWs
     }
 
+    # Best-effort fallback to ensure OBS actually closes like the legacy script.
+    try {
+      if (Get-Process -Name $Config.Processes.ObsProcessName -ErrorAction SilentlyContinue) {
+        Write-ZwiftLog -Level Info -Message 'Ensuring OBS application is closed.'
+        $closed = Stop-ObsApplicationProcess -ProcessName $Config.Processes.ObsProcessName -WaitSec 10
+        if ($closed) {
+          Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS closed'
+        }
+      }
+    } catch {
+      Write-ZwiftLog -Level Warn -Message "OBS process shutdown fallback failed: $($_.Exception.Message)"
+    }
+
     # Restore primary display
     if ($changedPrimary) {
       try {
         Set-PrimaryDisplaySafe -ZeroBasedIndex $originalPrimaryDisplay | Out-Null
+        Add-CompletedTask -Tracker $taskTracker -TaskName 'Primary display restored'
       } catch {
         Write-ZwiftLog -Level Warn -Message "Failed to restore primary display: $($_.Exception.Message)"
       }
@@ -1202,6 +1630,7 @@ function Invoke-MonitorZwift {
         $sauceProcs | Stop-Process -Force -ErrorAction SilentlyContinue
         Write-ZwiftLog -Level Info -Message "Closed Sauce-related processes: $($sauceProcs.Count)"
       }
+      Add-CompletedTask -Tracker $taskTracker -TaskName 'Sauce for Zwift closed or skipped'
     } catch {
       Write-ZwiftLog -Level Warn -Message "Sauce cleanup failed: $($_.Exception.Message)"
     }
@@ -1212,6 +1641,21 @@ function Invoke-MonitorZwift {
 		$null = Stop-PowerToysAwake
 	}
 
+    # Stop Spotify playback and close Spotify to mirror MonitorZwift-v2 behavior.
+    try {
+      $spotifyProc = Get-Process -Name $Config.Processes.SpotifyProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($spotifyProc) {
+        Write-ZwiftLog -Level Info -Message 'Stopping Spotify playback and closing Spotify.'
+        if ($spotifyProc.MainWindowHandle -ne 0) {
+          $null = Send-SpacebarToProcess -Process $spotifyProc -Description 'Send Pause hotkey (Spacebar) to Spotify'
+        }
+        $spotifyProc | Stop-Process -Force -ErrorAction SilentlyContinue
+        Add-CompletedTask -Tracker $taskTracker -TaskName 'Spotify stopped and closed after recording'
+      }
+    } catch {
+      Write-ZwiftLog -Level Warn -Message "Spotify shutdown failed: $($_.Exception.Message)"
+    }
+
     # FreeFileSync jobs
     if ($Config.FreeFileSync.RunOnExit) {
       try {
@@ -1220,7 +1664,9 @@ function Invoke-MonitorZwift {
         $b2 = Resolve-ConfigPath $Config.Paths.RecordingsToNasBatch
         Write-ZwiftLog -Level Info -Message 'Starting FreeFileSync batch jobs...'
         Start-Process -FilePath $ffs -ArgumentList "`"$b1`"" | Out-Null
+        Add-CompletedTask -Tracker $taskTracker -TaskName 'FreeFileSync batch job started'
         Start-Process -FilePath $ffs -ArgumentList "`"$b2`"" | Out-Null
+        Add-CompletedTask -Tracker $taskTracker -TaskName 'FreeFileSync batch job 2 started'
       } catch {
         Write-ZwiftLog -Level Warn -Message "FreeFileSync launch failed: $($_.Exception.Message)"
       }
@@ -1237,9 +1683,12 @@ function Invoke-MonitorZwift {
         } else {
           Start-Process -FilePath $edge -ArgumentList @($Config.Browser.Urls) | Out-Null
         }
+        Add-CompletedTask -Tracker $taskTracker -TaskName 'Microsoft Edge launched'
       } catch {
         Write-ZwiftLog -Level Warn -Message "Edge launch failed: $($_.Exception.Message)"
       }
+    } else {
+      Add-CompletedTask -Tracker $taskTracker -TaskName 'Microsoft Edge skipped'
     }
 
     # Explorer
@@ -1247,10 +1696,22 @@ function Invoke-MonitorZwift {
       foreach ($p in @($Config.Paths.ZwiftMediaDir, $Config.Paths.ZwiftPicturesDir)) {
         $rp = Resolve-ConfigPath $p
         if ($rp -and (Test-Path -LiteralPath $rp)) {
-          try { Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$rp`"" | Out-Null } catch { Write-Verbose "Explorer open failed: $($_.Exception.Message)" }
+          try {
+            Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$rp`"" | Out-Null
+            if ($rp -eq (Resolve-ConfigPath $Config.Paths.ZwiftMediaDir)) {
+              Add-CompletedTask -Tracker $taskTracker -TaskName 'Opened File Explorer for ZwiftMediaPath'
+            } elseif ($rp -eq (Resolve-ConfigPath $Config.Paths.ZwiftPicturesDir)) {
+              Add-CompletedTask -Tracker $taskTracker -TaskName 'Opened File Explorer for ZwiftPicturesPath'
+            }
+          } catch { Write-Verbose "Explorer open failed: $($_.Exception.Message)" }
         }
       }
     }
+
+    Add-CompletedTask -Tracker $taskTracker -TaskName 'Final validation and review process started'
+    Show-TaskCompletionSummary -Tracker $taskTracker
+    $reviewSeconds = Get-ReviewRemainingTime -Hours $Config.PowerToys.Awake.Hours -Minutes 0 -Seconds 0
+    Invoke-ReviewCountdown -RemainingTimeSec $reviewSeconds
 
     Stop-RunLogging
   }

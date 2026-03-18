@@ -255,7 +255,7 @@ This script performs the following tasks:
 	Hotkey to close OBS gracefully. Default: '%{F4}' (Alt+F4).
 
 .PARAMETER ZwiftLogPath
-	Path to the Zwift log file. Default: 'C:\Users\Nick\Dropbox\PC (2)\Documents\Zwift\Logs\Log.txt'.
+	Path to the Zwift log file. Default: 'C:\Users\Nick\AppData\Local\Zwift\logs\Log.txt'.
 
 .PARAMETER ObsLogDir
 	Path to the OBS log directory. Default: "$env:APPDATA\obs-studio\logs".
@@ -360,7 +360,7 @@ param (
 	[string]$ObsProcessName = 'obs64',
 
 	# Used in Step 10.5: Monitor Zwift log for 'GameFlowState Riding' and check OBS
-	[string]$ZwiftLogPath = 'C:\Users\Nick\Dropbox\PC (2)\Documents\Zwift\Logs\Log.txt',
+	[string]$ZwiftLogPath = 'C:\Users\Nick\AppData\Local\Zwift\logs\Log.txt',
 	[string]$ObsLogDir = "$env:APPDATA\obs-studio\logs",
 	[string]$obsPath = 'C:\Program Files\obs-studio\bin\64bit\obs64.exe',
 	[string]$ObsRecordingStartLogMessage = '==== Recording Start',
@@ -531,6 +531,29 @@ function Test-LogPatternMatch {
 	return $false
 }
 
+function Test-ManualOverrideKeyPressed {
+	[CmdletBinding()]
+	param(
+		[System.ConsoleKey]$OverrideKey = [System.ConsoleKey]::F8,
+		[string]$Description = 'the current wait'
+	)
+
+	try {
+		while ([Console]::KeyAvailable) {
+			$keyInfo = [Console]::ReadKey($true)
+			if ($keyInfo.Key -eq $OverrideKey) {
+				Write-Console "$(Get-Date): Manual override key '$OverrideKey' pressed while waiting for $Description. Continuing." -ForegroundColor Yellow
+				return $true
+			}
+		}
+	}
+	catch {
+		Write-Verbose "Manual override key check failed: $($_.Exception.Message)"
+	}
+
+	return $false
+}
+
 function Wait-ForLogPatterns {
 	[CmdletBinding()]
 	param(
@@ -538,7 +561,8 @@ function Wait-ForLogPatterns {
 		[Parameter(Mandatory)] [string[]]$Patterns,
 		[int]$PollSeconds = 1,
 		[int]$InitialTailLines = 2000,
-		[string]$MatchDescription = 'log pattern'
+		[string]$MatchDescription = 'log pattern',
+		[System.ConsoleKey]$ManualOverrideKey = [System.ConsoleKey]::F8
 	)
 
 	if (-not (Test-Path -LiteralPath $LiteralPath)) {
@@ -567,6 +591,10 @@ function Wait-ForLogPatterns {
 		$null = $reader.BaseStream.Seek(0, [System.IO.SeekOrigin]::End)
 
 		while ($true) {
+			if (Test-ManualOverrideKeyPressed -OverrideKey $ManualOverrideKey -Description $MatchDescription) {
+				return $true
+			}
+
 			Start-Sleep -Seconds ([Math]::Max(1, $PollSeconds))
 			while ($null -ne ($line = $reader.ReadLine())) {
 				foreach ($pattern in $Patterns) {
@@ -582,6 +610,128 @@ function Wait-ForLogPatterns {
 		if ($null -ne $reader) { $reader.Close() }
 		elseif ($null -ne $logStream) { $logStream.Close() }
 	}
+}
+
+function Get-LatestObsLogFile {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory)] [string]$ObsLogDirectory
+	)
+
+	if (-not (Test-Path -LiteralPath $ObsLogDirectory)) {
+		return $null
+	}
+
+	return Get-ChildItem -Path $ObsLogDirectory -Filter '*.txt' -ErrorAction SilentlyContinue |
+		Sort-Object LastWriteTime -Descending |
+		Select-Object -First 1
+}
+
+function Test-ObsRecordingStartedInLog {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory)] [string]$ObsLogDirectory,
+		[Parameter(Mandatory)] [string]$RecordingStartMessage
+	)
+
+	$latestLog = Get-LatestObsLogFile -ObsLogDirectory $ObsLogDirectory
+	if (-not $latestLog) {
+		return $false
+	}
+
+	try {
+		$logContent = Get-Content -LiteralPath $latestLog.FullName -Raw -ErrorAction Stop
+		return ($logContent -match [regex]::Escape($RecordingStartMessage) -or $logContent -match 'Recording started' -or $logContent -match 'Start recording')
+	}
+	catch {
+		Write-Verbose "Failed reading OBS log '$($latestLog.FullName)': $($_.Exception.Message)"
+		return $false
+	}
+}
+
+function Start-ObsRecordingWithHotkeyRetry {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory)] [string]$ObsProcessName,
+		[Parameter(Mandatory)] [string]$ObsRecordingHotkey,
+		[Parameter(Mandatory)] [string]$ObsLogDirectory,
+		[Parameter(Mandatory)] [string]$RecordingStartMessage,
+		[int]$MaxAttempts = 3,
+		[int]$ActivationRetries = 5,
+		[int]$FocusSettleMilliseconds = 1500,
+		[int]$ConfirmTimeoutSeconds = 10
+	)
+
+	$wshell = New-Object -ComObject WScript.Shell
+
+	for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+		if (Test-ObsRecordingStartedInLog -ObsLogDirectory $ObsLogDirectory -RecordingStartMessage $RecordingStartMessage) {
+			Write-Console "$(Get-Date): OBS recording already active before retry attempt $attempt." -ForegroundColor Green
+			return $true
+		}
+
+		$obsProc = Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+		if (-not $obsProc) {
+			Write-Console "$(Get-Date): OBS process not found for recording attempt $attempt of $MaxAttempts." -ForegroundColor Red
+			return $false
+		}
+
+		$activated = $false
+		for ($retry = 1; $retry -le $ActivationRetries -and -not $activated; $retry++) {
+			$obsProc = Get-Process -Id $obsProc.Id -ErrorAction SilentlyContinue
+			if ($obsProc -and $obsProc.MainWindowHandle -ne 0) {
+				$activated = Set-WindowFocus $obsProc
+				if ($activated) {
+					try { [void]$wshell.AppActivate($obsProc.Id) } catch { Write-Verbose "OBS AppActivate failed: $($_.Exception.Message)" }
+					Start-Sleep -Milliseconds $FocusSettleMilliseconds
+				}
+				else {
+					Write-Console "[$(Get-Date -Format o)] OBS activation retry $retry of $ActivationRetries failed for attempt $attempt." -ForegroundColor Yellow
+					Start-Sleep -Seconds 1
+				}
+			}
+			else {
+				Write-Console "[$(Get-Date -Format o)] OBS MainWindowHandle not ready for attempt $attempt. Waiting..." -ForegroundColor Yellow
+				Start-Sleep -Seconds 1
+			}
+		}
+
+		if (-not $activated) {
+			Write-Console "[$(Get-Date -Format o)] Could not activate OBS window for attempt $attempt of $MaxAttempts." -ForegroundColor Yellow
+		}
+
+		Write-Console "$(Get-Date): Sending OBS recording hotkey (attempt $attempt of $MaxAttempts)..." -ForegroundColor Cyan
+		$wshell.SendKeys($ObsRecordingHotkey)
+
+		$deadline = (Get-Date).AddSeconds($ConfirmTimeoutSeconds)
+		while ((Get-Date) -lt $deadline) {
+			if (Test-ObsRecordingStartedInLog -ObsLogDirectory $ObsLogDirectory -RecordingStartMessage $RecordingStartMessage) {
+				Write-Console "$(Get-Date): OBS recording confirmed in log after attempt $attempt." -ForegroundColor Green
+				$obsProc = Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+				if ($obsProc -and $obsProc.MainWindowHandle -ne 0) {
+					if (-not ([System.Management.Automation.PSTypeName]'Win32Activate').Type) {
+						$win32 = @'
+using System;
+using System.Runtime.InteropServices;
+public class Win32Activate {
+	[DllImport("user32.dll")]
+	public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+}
+'@
+						Add-Type -TypeDefinition $win32 -ErrorAction SilentlyContinue
+					}
+					[Win32Activate]::ShowWindowAsync($obsProc.MainWindowHandle, 6) | Out-Null
+				}
+				return $true
+			}
+
+			Start-Sleep -Seconds 1
+		}
+
+		Write-Console "$(Get-Date): OBS recording was not confirmed after attempt $attempt. Retrying..." -ForegroundColor Yellow
+	}
+
+	return $false
 }
 
 # Win32 API helper for robust window activation (works for OBS and others)
@@ -1385,7 +1535,7 @@ catch {
 $GameFlowRidingDetected = $false
 
 if (Test-Path -Path $ZwiftLogPath) {
-	Write-Console "$(Get-Date): Monitoring Zwift log for ride-start markers..." -ForegroundColor Cyan
+	Write-Console "$(Get-Date): Monitoring Zwift log for ride-start markers... Press F8 to continue manually." -ForegroundColor Cyan
 	$rideStartPatterns = @(
 		'\[ZWATCHDOG\]: GameFlowState Riding',
 		'INFO LEVEL: \[GameState\] Starting Ride\.',
@@ -1435,10 +1585,9 @@ if (Test-Path -Path $ZwiftLogPath) {
 
 	# After checking/starting OBS, check if recording has started in the latest OBS log
 	if ((Test-Path $ObsLogDir) -and (Get-ChildItem -Path $ObsLogDir -Filter '*.txt' -ErrorAction SilentlyContinue)) {
-		$latestLog = Get-ChildItem -Path $ObsLogDir -Filter '*.txt' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+		$latestLog = Get-LatestObsLogFile -ObsLogDirectory $ObsLogDir
 		if ($latestLog) {
-			$logContent = Get-Content $latestLog.FullName -Raw
-			if ($logContent -match [regex]::Escape($ObsRecordingStartLogMessage) -or $logContent -match 'Recording started' -or $logContent -match 'Start recording') {
+			if (Test-ObsRecordingStartedInLog -ObsLogDirectory $ObsLogDir -RecordingStartMessage $ObsRecordingStartLogMessage) {
 				# Ensure OBS window is active before sending the hotkey
 				if ($obsProc -and $obsProc.MainWindowTitle) {
 					$retryCount = 0
@@ -1462,55 +1611,15 @@ if (Test-Path -Path $ZwiftLogPath) {
 				Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS recording already started, detected in log'
 			}
 			else {
-				Write-Console "$(Get-Date): OBS recording not detected in log. Attempting to start recording..." -ForegroundColor Yellow
-				# Try to start recording using OBS hotkey (simulate hotkey Ctrl+F11 by default)
-				$wshell = New-Object -ComObject WScript.Shell
-				$obsProc = Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue
-				$maxRetries = 5
-				$retryCount = 0
-				$activated = $false
-
-				while ($retryCount -lt $maxRetries -and -not $activated) {
-					if ($obsProc -and $obsProc.MainWindowHandle -ne 0) {
-						$activated = Set-WindowFocus $obsProc
-						if (-not $activated) {
-							Write-Console "[$(Get-Date -Format o)] Retry $($retryCount+1): Failed to activate OBS window. Retrying in 1s..." -ForegroundColor Yellow
-							Start-Sleep -Seconds 1
-						}
-					}
-					else {
-						Write-Console "[$(Get-Date -Format o)] OBS MainWindowHandle not ready. Waiting..." -ForegroundColor Yellow
-						Start-Sleep -Seconds 1
-						$obsProc = Get-Process -Name $ObsProcessName -ErrorAction SilentlyContinue
-					}
-					$retryCount++
+				Write-Console "$(Get-Date): OBS recording not detected in log. Attempting to start recording with retries..." -ForegroundColor Yellow
+				$recordingStarted = Start-ObsRecordingWithHotkeyRetry -ObsProcessName $ObsProcessName -ObsRecordingHotkey $ObsRecordingHotkey -ObsLogDirectory $ObsLogDir -RecordingStartMessage $ObsRecordingStartLogMessage -MaxAttempts 3 -ActivationRetries 5 -FocusSettleMilliseconds 1500 -ConfirmTimeoutSeconds 10
+				if ($recordingStarted) {
+					Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS recording started'
+					Start-Sleep -Seconds 2
 				}
-
-				if (-not $activated) {
-					Write-Console "[$(Get-Date -Format o)] Could not activate OBS window after $maxRetries attempts. Please manually focus OBS before recording." -ForegroundColor Red
-					Read-Host 'Press Enter to continue and send the recording hotkey to OBS'
+				else {
+					Write-Console "$(Get-Date): OBS recording could not be confirmed after multiple attempts. Please focus OBS and start recording manually if needed." -ForegroundColor Red
 				}
-
-				Start-Sleep -Seconds 1
-				$wshell.SendKeys($ObsRecordingHotkey) # <-- Send the start recording hotkey (Ctrl+F11 by default)
-				# Minimize OBS after starting recording
-				$obsHwnd = $obsProc.MainWindowHandle
-				if ($obsHwnd -ne 0) {
-					if (-not ([System.Management.Automation.PSTypeName]'Win32Activate').Type) {
-						$win32 = @'
-using System;
-using System.Runtime.InteropServices;
-public class Win32Activate {
-	[DllImport("user32.dll")]
-	public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-}
-'@
-						Add-Type -TypeDefinition $win32 -ErrorAction SilentlyContinue
-					}
-					[Win32Activate]::ShowWindowAsync($obsHwnd, 6) | Out-Null # SW_MINIMIZE = 6
-				}
-				Add-CompletedTask -Tracker $taskTracker -TaskName 'OBS recording started'
-				Start-Sleep -Seconds 3
 			}
 		}
 		else {
