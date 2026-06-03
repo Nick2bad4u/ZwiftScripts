@@ -17,12 +17,12 @@
 #
 # Steps:
 # - Harden Runner: Uses the step-security/harden-runner action to enhance security.
-#   - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+#   - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411
 #   - with:
 #     - egress-policy: audit - Audits egress traffic.
 #
 # - Labeler: Uses the actions/labeler action to apply labels based on modified paths.
-#   - uses: actions/labeler@634933edcd8ababfe52f92936142cc22ac488b1b
+#   - uses: actions/labeler@f27b608878404679385c85cfa523b85ccb86e213
 #   - with:
 #     - repo-token: "${{ secrets.GITHUB_TOKEN }}" - Uses the GitHub token for authentication.
 #
@@ -52,10 +52,10 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: audit
 
-      - uses: actions/labeler@634933edcd8ababfe52f92936142cc22ac488b1b # v6.0.1
+      - uses: actions/labeler@f27b608878404679385c85cfa523b85ccb86e213 # v6.1.0
         with:
           repo-token: "${{ secrets.GITHUB_TOKEN }}"
