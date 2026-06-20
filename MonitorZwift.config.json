@@ -60,7 +60,7 @@
 			"Enabled": true,
 			"Host": "192.168.1.223",
 			"Port": 4455,
-			"Password": "8k7E7nG2UVVHgJBP",
+			"Password": "",
 			"ConnectTimeoutSec": 10
 		},
 		"Hotkeys": {
