@@ -24,7 +24,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout Repo Code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Run StyleLint
         uses: actions-hub/stylelint@79a72921dfce2e51791be2df406f0c103fb47553 # v1.1.6
